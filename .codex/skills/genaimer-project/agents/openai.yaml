@@ -1,0 +1,8 @@
+interface:
+  display_name: "GenAimer Project"
+  short_description: "Maintain and extend the GenAimer Luau project"
+  brand_color: "#AA64DC"
+  default_prompt: "Use $genaimer-project to implement and validate an update to the GenAimer project."
+
+policy:
+  allow_implicit_invocation: true

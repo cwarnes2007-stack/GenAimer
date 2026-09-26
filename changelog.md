@@ -8,6 +8,8 @@ All notable changes to GenAimer are documented here.
 
 - Added repository documentation and ignore rules.
 - Added this agent guide and project changelog.
+- Added the project-local `$genaimer-project` Codex skill with UI metadata,
+  implementation invariants, validation guidance, and repository workflow.
 - Added a redesigned performance monitor with:
   - Padded metric cards for FPS, ping, memory, and session duration.
   - Color-coded FPS and ping status.

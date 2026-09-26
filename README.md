@@ -7,6 +7,13 @@ aim-assist controls, movement utilities, profiles, diagnostics, and cleanup.
 
 - `ESP_Rayfield_Build14_StartupHardened.lua` — current canonical source.
 
+## Codex skill
+
+- `.codex/skills/genaimer-project/SKILL.md` — project-aware instructions for
+  maintaining and extending GenAimer with Codex.
+- Invoke it explicitly with `$genaimer-project`; automatic discovery is also
+  enabled.
+
 ## Project notes
 
 - Make changes in this repository folder, not the Downloads copy.
