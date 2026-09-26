@@ -6,6 +6,8 @@ All notable changes to GenAimer are documented here.
 
 ### Added
 
+- Added a Settings profile manager that mirrors Rayfield's named
+  configuration actions with refresh, save, load, and protected-delete controls.
 - Added dynamic skeleton support for standard R6/R15 rigs and custom models
   connected by Motor6D joints.
 - Added a render-limited ESP scan interval control with a 1 ms setting that
@@ -25,6 +27,13 @@ All notable changes to GenAimer are documented here.
 
 ### Changed
 
+- Minified `GenAimer.lua` into a single physical line while preserving its
+  executable code and string contents.
+- Reworked the performance monitor into wider stacked metric cards, smoothed
+  FPS sampling, and reset diagnostics cleanly while the HUD is hidden.
+- Removed the old Default-only save/load buttons from Settings.
+- Removed the startup toast and UI-error toast; diagnostics now stay in the
+  executor console unless the user performs a profile action.
 - Renamed the canonical source to `GenAimer.lua` and removed Build 14 and
   Startup Hardened branding from the live interface.
 - Removed the temporary Status tab and replaced non-ASCII UI strings with
