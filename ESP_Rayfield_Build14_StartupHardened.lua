@@ -1,0 +1,3373 @@
+-- ESP / Aim interface - Rayfield Gen2 build 14
+-- Startup-hardened build based on build 13.
+-- Rayfield is bootstrapped before the ESP/cursor/HUD/movement systems so a later
+-- feature error cannot prevent the interface itself from appearing.
+-- Configuration saving is enabled only when the executor exposes the required
+-- filesystem functions; otherwise the UI falls back to in-memory settings.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local GuiService = game:GetService("GuiService")
+local Stats = game:GetService("Stats")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local Runtime = (type(getgenv) == "function" and getgenv()) or _G
+
+if type(Runtime.ESPInterfaceUnload) == "function" then
+    pcall(Runtime.ESPInterfaceUnload)
+end
+
+------------------------------------------------------------
+-- Configuration
+------------------------------------------------------------
+
+local Config = {
+    Players = true,
+    Boxes = true,
+    Health = true,
+    Chams = true,
+    Skeleton = false,
+    Fullbright = false,
+    Cursor = true,
+    Names = true,
+    DisplayName = false,
+    ThreatArrows = false,
+    CombatESP = true,
+
+    ESPDistance = 1000,
+
+    AimAssist = false,
+    AimMode = "Standard",
+    LegitReactionTime = 0.12,
+    AimTeamCheck = true,
+    AimLock = true,
+    AimPrediction = false,
+    SmoothAim = true,
+    CameraRecoilDamping = false,
+    AimRadius = 150,
+    AimStrength = 0.16,
+    AimFollowSpeed = 100,
+    AimTurnSpeed = 240,
+    RecoilStrength = 0.65,
+    AimTarget = "Head",
+    AimLeadTime = 0.10,
+    AimMaxDistance = 1000,
+    InfiniteAimRange = false,
+    AimFrontOnly = true,
+    AimFrontAngle = 75,
+    AimScanInterval = 1.0,
+
+    WalkSpeedEnabled = false,
+    WalkSpeed = 16,
+    Fly = false,
+    FlySpeed = 30,
+    Noclip = false,
+
+    Crosshair = false,
+    CrosshairSize = 10,
+    CrosshairGap = 5,
+    CrosshairThickness = 2,
+    CrosshairDynamic = false,
+    CrosshairColor = "Purple",
+
+    AimCircleVisible = true,
+    AimCircleThickness = 1,
+    AimCircleColor = "Purple",
+
+    PerformanceHUD = true,
+    Notifications = true,
+}
+
+local COLORS = {
+    Accent = Color3.fromRGB(170, 100, 220),
+    ESP = Color3.fromRGB(80, 170, 255),
+    Red = Color3.fromRGB(220, 100, 100),
+}
+
+local Tracked = {}
+local Connections = {}
+local LockedCharacter = nil
+local SelectedCharacter = nil
+local AimCandidateCharacter = nil
+local AimCandidateSince = 0
+local TargetScanCharacter = nil
+local TargetScanNextAt = 0
+local Unloaded = false
+
+local ESP_BIND_NAME = "ESP_Build11_Update"
+local AIM_BIND_NAME = "ESP_Build11_AimAssist"
+local RECOIL_CAPTURE_BIND_NAME = "ESP_Build11_RecoilCapture"
+local FOV_BIND_NAME = "ESP_Build11_FOV"
+local CURSOR_BIND_NAME = "ESP_Build11_Cursor"
+local MOVEMENT_BIND_NAME = "ESP_Build11_Movement"
+local CROSSHAIR_BIND_NAME = "ESP_Build14_Crosshair"
+
+
+------------------------------------------------------------
+-- Rayfield Gen2 early bootstrap
+------------------------------------------------------------
+
+local Rayfield = nil
+local Window = nil
+local Controls = {}
+local unload
+local UiVisible = true
+local RayfieldConfigEnabled = false
+local RayfieldBootError = nil
+
+local function hasExecutorFileApi()
+    -- Gen2 can save/load with the basic APIs, but its built-in configuration
+    -- manager may also enumerate and delete profiles. Only enable persistence
+    -- when the full common executor file API is available.
+    return type(writefile) == "function"
+        and type(readfile) == "function"
+        and type(isfile) == "function"
+        and type(isfolder) == "function"
+        and type(makefolder) == "function"
+        and type(listfiles) == "function"
+        and type(delfile) == "function"
+end
+
+local function tryLoadRayfield(url)
+    local ok, result = pcall(function()
+        -- Match the official Gen2 loader as closely as possible for executor
+        -- compatibility: one HttpGet argument, then loadstring(source)().
+        local source = game:HttpGet(url)
+        assert(type(source) == "string" and #source > 100, "Rayfield download returned no usable source")
+
+        local compiler = loadstring
+        assert(type(compiler) == "function", "This executor does not expose loadstring")
+
+        local chunk, compileError = compiler(source)
+        assert(type(chunk) == "function", "Rayfield compile failed: " .. tostring(compileError))
+
+        local library = chunk()
+        assert(type(library) == "table", "Rayfield loader returned " .. typeof(library))
+        assert(type(library.CreateWindow) == "function", "Rayfield CreateWindow is unavailable")
+        return library
+    end)
+
+    return ok, result
+end
+
+local function loadRayfieldGen2()
+    local ok, result = tryLoadRayfield("https://sirius.menu/gen2")
+    if ok and result then
+        return result
+    end
+
+    local stableError = tostring(result)
+    warn("[Build14] Stable Rayfield Gen2 load failed: " .. stableError)
+
+    -- Preview is only a loader fallback. Stable remains the preferred build.
+    local previewOk, previewResult = tryLoadRayfield("https://sirius.menu/gen2-preview")
+    if previewOk and previewResult then
+        warn("[Build14] Using Rayfield Gen2 preview because stable failed")
+        return previewResult
+    end
+
+    RayfieldBootError = "stable: " .. stableError .. " | preview: " .. tostring(previewResult)
+    warn("[Build14] Rayfield Gen2 unavailable: " .. RayfieldBootError)
+    return nil
+end
+
+local function createRayfieldWindow(library)
+    if not library then
+        return nil
+    end
+
+    local props = {
+        name = "ESP • build 14",
+        subtitle = "Startup Hardened",
+        sidebarLayout = true,
+        theme = "amethyst",
+        showName = "ESP",
+    }
+
+    if hasExecutorFileApi() then
+        props.configuration = {
+            autoSave = true,
+            autoLoad = true,
+            fileName = "Default",
+            customFolder = "ESPBuild14",
+        }
+        RayfieldConfigEnabled = true
+    end
+
+    local ok, result = pcall(function()
+        return library:CreateWindow(props)
+    end)
+
+    -- Some executors partially expose file APIs but still reject config writes.
+    -- Retry once without persistence rather than losing the entire interface.
+    if not ok or not result then
+        local firstError = tostring(result)
+        RayfieldConfigEnabled = false
+        props.configuration = nil
+
+        local retryOk, retryResult = pcall(function()
+            return library:CreateWindow(props)
+        end)
+
+        if retryOk and retryResult then
+            warn("[Build14] Rayfield config disabled after startup error: " .. firstError)
+            return retryResult
+        end
+
+        RayfieldBootError = "CreateWindow failed: " .. firstError .. " | fallback: " .. tostring(retryResult)
+        warn("[Build14] " .. RayfieldBootError)
+        return nil
+    end
+
+    return result
+end
+
+Rayfield = loadRayfieldGen2()
+Window = createRayfieldWindow(Rayfield)
+
+-- Create one tab immediately. If something later in the script fails, the user
+-- can still see that Rayfield itself loaded instead of getting a blank failure.
+local RayfieldFallbackGui = nil
+
+if Window then
+    pcall(function()
+        local statusTab = Window:CreateTab({name = "Status"})
+        statusTab:CreateSection({name = "Rayfield loaded — initialising features..."})
+    end)
+else
+    -- If Rayfield cannot start, show the actual bootstrap error on-screen so the
+    -- failure is not mistaken for the script doing nothing.
+    pcall(function()
+        RayfieldFallbackGui = Instance.new("ScreenGui")
+        RayfieldFallbackGui.Name = "ESP_Build14_RayfieldError"
+        RayfieldFallbackGui.ResetOnSpawn = false
+        RayfieldFallbackGui.DisplayOrder = 100000
+        RayfieldFallbackGui.Parent = PlayerGui
+
+        local panel = Instance.new("Frame")
+        panel.AnchorPoint = Vector2.new(0.5, 0)
+        panel.Position = UDim2.new(0.5, 0, 0, 24)
+        panel.Size = UDim2.new(0, 620, 0, 150)
+        panel.BackgroundColor3 = Color3.fromRGB(22, 18, 28)
+        panel.BorderSizePixel = 0
+        panel.Parent = RayfieldFallbackGui
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 10)
+        corner.Parent = panel
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(220, 90, 110)
+        stroke.Thickness = 1
+        stroke.Parent = panel
+
+        local title = Instance.new("TextLabel")
+        title.Position = UDim2.fromOffset(14, 10)
+        title.Size = UDim2.new(1, -28, 0, 24)
+        title.BackgroundTransparency = 1
+        title.Text = "Build 14 — Rayfield failed to start"
+        title.TextColor3 = Color3.fromRGB(255, 220, 225)
+        title.Font = Enum.Font.GothamBold
+        title.TextSize = 16
+        title.TextXAlignment = Enum.TextXAlignment.Left
+        title.Parent = panel
+
+        local body = Instance.new("TextLabel")
+        body.Position = UDim2.fromOffset(14, 40)
+        body.Size = UDim2.new(1, -28, 1, -52)
+        body.BackgroundTransparency = 1
+        body.Text = tostring(RayfieldBootError or "Unknown Rayfield loader error")
+        body.TextColor3 = Color3.fromRGB(235, 230, 240)
+        body.Font = Enum.Font.Code
+        body.TextSize = 12
+        body.TextWrapped = true
+        body.TextYAlignment = Enum.TextYAlignment.Top
+        body.TextXAlignment = Enum.TextXAlignment.Left
+        body.Parent = panel
+    end)
+end
+
+------------------------------------------------------------
+-- Utility
+------------------------------------------------------------
+
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(Connections, connection)
+    return connection
+end
+
+local function create(className, properties, parent)
+    local object = Instance.new(className)
+    for property, value in pairs(properties) do
+        object[property] = value
+    end
+    object.Parent = parent
+    return object
+end
+
+local function getRoot(character)
+    if not character then
+        return nil
+    end
+    return character:FindFirstChild("HumanoidRootPart")
+        or character.PrimaryPart
+        or character:FindFirstChildWhichIsA("BasePart")
+end
+
+local function getHumanoid(character)
+    return character and character:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function getName(player)
+    if Config.DisplayName then
+        return player.DisplayName
+    end
+    return player.Name
+end
+
+local function isAlive(character)
+    local humanoid = getHumanoid(character)
+    return not humanoid or humanoid.Health > 0
+end
+
+local function getHealth(character)
+    local humanoid = getHumanoid(character)
+    if humanoid and humanoid.MaxHealth > 0 then
+        return humanoid.Health, humanoid.MaxHealth
+    end
+
+    local healthValue = character:FindFirstChild("Health")
+    local maxHealthValue = character:FindFirstChild("MaxHealth")
+
+    if healthValue and (healthValue:IsA("NumberValue") or healthValue:IsA("IntValue")) then
+        local maximum = 100
+        if maxHealthValue and (maxHealthValue:IsA("NumberValue") or maxHealthValue:IsA("IntValue")) then
+            maximum = maxHealthValue.Value
+        end
+        return healthValue.Value, maximum
+    end
+
+    local attributeHealth = character:GetAttribute("Health")
+    if typeof(attributeHealth) == "number" then
+        local attributeMaxHealth = character:GetAttribute("MaxHealth")
+        if typeof(attributeMaxHealth) ~= "number" then
+            attributeMaxHealth = 100
+        end
+        return attributeHealth, attributeMaxHealth
+    end
+
+    return nil, nil
+end
+
+local function sameTeam(player)
+    if not Config.AimTeamCheck then
+        return false
+    end
+
+    -- Team is nil for both players in experiences that do not use Roblox
+    -- Teams. Comparing TeamColor in that case incorrectly treats every
+    -- player as a teammate (usually everyone has the default White color).
+    if LocalPlayer.Team ~= nil or player.Team ~= nil then
+        return LocalPlayer.Team ~= nil
+            and player.Team ~= nil
+            and LocalPlayer.Team == player.Team
+    end
+
+    -- Only use TeamColor as a fallback for custom team systems. Neutral
+    -- players in a no-team experience must remain valid aim candidates.
+    if (not LocalPlayer.Neutral or not player.Neutral)
+        and LocalPlayer.TeamColor ~= nil
+        and player.TeamColor ~= nil then
+        return LocalPlayer.TeamColor == player.TeamColor
+    end
+
+    return false
+end
+
+------------------------------------------------------------
+-- Fullbright
+------------------------------------------------------------
+
+local Fullbright = {
+    Enabled = false,
+    Effect = nil,
+    LightingBackup = nil,
+    EffectBackup = {},
+}
+
+local function saveLighting()
+    if Fullbright.LightingBackup then
+        return
+    end
+
+    Fullbright.LightingBackup = {
+        Brightness = Lighting.Brightness,
+        Ambient = Lighting.Ambient,
+        OutdoorAmbient = Lighting.OutdoorAmbient,
+        ColorShift_Top = Lighting.ColorShift_Top,
+        ColorShift_Bottom = Lighting.ColorShift_Bottom,
+        EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale,
+        EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale,
+        FogStart = Lighting.FogStart,
+        FogEnd = Lighting.FogEnd,
+        FogColor = Lighting.FogColor,
+        GlobalShadows = Lighting.GlobalShadows,
+        ExposureCompensation = Lighting.ExposureCompensation,
+    }
+end
+
+local function restoreLighting()
+    if not Fullbright.LightingBackup then
+        return
+    end
+
+    for property, value in pairs(Fullbright.LightingBackup) do
+        pcall(function()
+            Lighting[property] = value
+        end)
+    end
+
+    Fullbright.LightingBackup = nil
+end
+
+local function getColorCorrection()
+    if Fullbright.Effect and Fullbright.Effect.Parent then
+        return Fullbright.Effect
+    end
+
+    local effect = Instance.new("ColorCorrectionEffect")
+    effect.Name = "ESP_Build11_Fullbright"
+    effect.Parent = Lighting
+    Fullbright.Effect = effect
+    return effect
+end
+
+local function setFullbright(enabled)
+    Config.Fullbright = enabled
+
+    if enabled == Fullbright.Enabled then
+        return
+    end
+
+    Fullbright.Enabled = enabled
+
+    if enabled then
+        saveLighting()
+
+        Lighting.Brightness = 3
+        Lighting.Ambient = Color3.new(1, 1, 1)
+        Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+        Lighting.ColorShift_Top = Color3.new(1, 1, 1)
+        Lighting.ColorShift_Bottom = Color3.new(1, 1, 1)
+        Lighting.EnvironmentDiffuseScale = 0
+        Lighting.EnvironmentSpecularScale = 0
+        Lighting.FogStart = 0
+        Lighting.FogEnd = 1000000
+        Lighting.FogColor = Color3.new(1, 1, 1)
+        Lighting.GlobalShadows = false
+        Lighting.ExposureCompensation = 1
+
+        for _, effect in ipairs(Lighting:GetChildren()) do
+            if effect:IsA("PostEffect") and effect ~= Fullbright.Effect then
+                Fullbright.EffectBackup[effect] = effect.Enabled
+                effect.Enabled = false
+            end
+        end
+
+        local correction = getColorCorrection()
+        correction.Enabled = true
+        correction.Brightness = 0.2
+        correction.Contrast = -0.05
+        correction.Saturation = 0
+        correction.TintColor = Color3.new(1, 1, 1)
+    else
+        restoreLighting()
+
+        for effect, wasEnabled in pairs(Fullbright.EffectBackup) do
+            if effect and effect.Parent then
+                effect.Enabled = wasEnabled
+            end
+        end
+        table.clear(Fullbright.EffectBackup)
+
+        if Fullbright.Effect then
+            Fullbright.Effect.Enabled = false
+        end
+    end
+end
+
+------------------------------------------------------------
+-- ESP drawing layer
+------------------------------------------------------------
+
+local ScreenGui = create("ScreenGui", {
+    Name = "ESP_Build11_Drawings",
+    ResetOnSpawn = false,
+    DisplayOrder = 998,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, PlayerGui)
+
+local SKELETON_R15 = {
+    {"Head", "UpperTorso"},
+    {"UpperTorso", "LowerTorso"},
+    {"UpperTorso", "LeftUpperArm"},
+    {"LeftUpperArm", "LeftLowerArm"},
+    {"LeftLowerArm", "LeftHand"},
+    {"UpperTorso", "RightUpperArm"},
+    {"RightUpperArm", "RightLowerArm"},
+    {"RightLowerArm", "RightHand"},
+    {"LowerTorso", "LeftUpperLeg"},
+    {"LeftUpperLeg", "LeftLowerLeg"},
+    {"LeftLowerLeg", "LeftFoot"},
+    {"LowerTorso", "RightUpperLeg"},
+    {"RightUpperLeg", "RightLowerLeg"},
+    {"RightLowerLeg", "RightFoot"},
+}
+
+local SKELETON_R6 = {
+    {"Head", "Torso"},
+    {"Torso", "Left Arm"},
+    {"Torso", "Right Arm"},
+    {"Torso", "Left Leg"},
+    {"Torso", "Right Leg"},
+}
+
+local function hideSkeleton(entry)
+    for _, line in ipairs(entry.SkeletonLines) do
+        line.Visible = false
+    end
+end
+
+local function updateSkeleton(entry, camera)
+    local character = entry.Character
+    local segments = character:FindFirstChild("UpperTorso") and SKELETON_R15 or SKELETON_R6
+    local projected = {}
+
+    local function positionOf(partName)
+        if projected[partName] == nil then
+            local part = character:FindFirstChild(partName)
+            if part and part:IsA("BasePart") then
+                local point, onScreen = camera:WorldToScreenPoint(part.Position)
+                projected[partName] = onScreen and point.Z > 0 and Vector2.new(point.X, point.Y) or false
+            else
+                projected[partName] = false
+            end
+        end
+        return projected[partName]
+    end
+
+    for index, line in ipairs(entry.SkeletonLines) do
+        local pair = segments[index]
+        local first = pair and positionOf(pair[1])
+        local second = pair and positionOf(pair[2])
+
+        if first and second then
+            local delta = second - first
+            line.Position = UDim2.fromOffset((first.X + second.X) / 2, (first.Y + second.Y) / 2)
+            line.Size = UDim2.fromOffset(delta.Magnitude, 2)
+            line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+            line.Visible = true
+        else
+            line.Visible = false
+        end
+    end
+end
+
+local function updateThreatArrow(entry, camera, root, distance)
+    local arrow = entry.ThreatArrow
+
+    if not Config.ThreatArrows then
+        arrow.Visible = false
+        return
+    end
+
+    local _, onScreen = camera:WorldToViewportPoint(root.Position)
+    if onScreen then
+        arrow.Visible = false
+        return
+    end
+
+    local localPoint = camera.CFrame:PointToObjectSpace(root.Position)
+    local direction
+
+    if localPoint.Z > 0 then
+        direction = Vector2.new(-localPoint.X, localPoint.Y)
+    else
+        direction = Vector2.new(localPoint.X, -localPoint.Y)
+    end
+
+    if direction.Magnitude < 0.001 then
+        direction = Vector2.new(0, 1)
+    end
+    direction = direction.Unit
+
+    local viewport = camera.ViewportSize
+    local halfX = math.max(20, viewport.X / 2 - 32)
+    local halfY = math.max(20, viewport.Y / 2 - 32)
+    local amount = math.min(
+        halfX / math.max(math.abs(direction.X), 0.001),
+        halfY / math.max(math.abs(direction.Y), 0.001)
+    )
+
+    local point = viewport / 2 + direction * amount - GuiService:GetGuiInset()
+    arrow.Position = UDim2.fromOffset(point.X, point.Y)
+    arrow.Rotation = math.deg(math.atan2(direction.Y, direction.X)) + 90
+    arrow.TextColor3 = distance < 150 and COLORS.Red or COLORS.Accent
+    arrow.Visible = true
+end
+
+local function removeEntry(character)
+    local entry = Tracked[character]
+    if not entry then
+        return
+    end
+
+    if entry.Highlight then
+        entry.Highlight:Destroy()
+    end
+    if entry.Billboard then
+        entry.Billboard:Destroy()
+    end
+    for _, line in ipairs(entry.SkeletonLines) do
+        line:Destroy()
+    end
+    if entry.ThreatArrow then
+        entry.ThreatArrow:Destroy()
+    end
+
+    if LockedCharacter == character then
+        LockedCharacter = nil
+    end
+    if SelectedCharacter == character then
+        SelectedCharacter = nil
+    end
+
+    Tracked[character] = nil
+end
+
+local function createEntry(player, character)
+    if player == LocalPlayer or Tracked[character] then
+        return
+    end
+
+    local root = getRoot(character)
+    if not root then
+        return
+    end
+
+    local skeletonLines = {}
+    for _ = 1, #SKELETON_R15 do
+        local line = create("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            BackgroundColor3 = COLORS.ESP,
+            BorderSizePixel = 0,
+            Visible = false,
+        }, ScreenGui)
+        table.insert(skeletonLines, line)
+    end
+
+    local threatArrow = create("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Size = UDim2.fromOffset(28, 28),
+        BackgroundTransparency = 1,
+        Text = "▲",
+        TextColor3 = COLORS.Accent,
+        TextStrokeTransparency = 0.25,
+        Font = Enum.Font.GothamBold,
+        TextSize = 25,
+        Visible = false,
+    }, ScreenGui)
+
+    local highlight = create("Highlight", {
+        Name = "ESP_Build11_Highlight",
+        Adornee = character,
+        FillColor = COLORS.ESP,
+        OutlineColor = COLORS.ESP,
+        FillTransparency = 0.72,
+        OutlineTransparency = 0,
+        DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+        Enabled = false,
+    }, ScreenGui)
+
+    local billboard = create("BillboardGui", {
+        Name = "ESP_Build11_Billboard",
+        Adornee = root,
+        Size = UDim2.fromScale(4, 6),
+        StudsOffset = Vector3.new(0, 0.8, 0),
+        AlwaysOnTop = true,
+        LightInfluence = 0,
+        MaxDistance = math.huge,
+        Enabled = false,
+    }, ScreenGui)
+
+    local container = create("Frame", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+    }, billboard)
+
+    local box = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromScale(0.62, 0.84),
+        BackgroundTransparency = 1,
+        Visible = false,
+    }, container)
+
+    create("UIStroke", {
+        Color = COLORS.ESP,
+        Thickness = 1,
+    }, box)
+
+    local healthBackground = create("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(0.14, 0, 0.5, 0),
+        Size = UDim2.new(0.04, 0, 0.84, 0),
+        BackgroundColor3 = Color3.new(0, 0, 0),
+        BorderSizePixel = 0,
+        Visible = false,
+    }, container)
+
+    local healthBar = create("Frame", {
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.fromScale(0, 1),
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Color3.fromRGB(0, 255, 0),
+        BorderSizePixel = 0,
+    }, healthBackground)
+
+    local nameLabel = create("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 1),
+        Position = UDim2.new(0.5, 0, 0.08, 0),
+        Size = UDim2.new(0.9, 0, 0.12, 0),
+        BackgroundTransparency = 1,
+        TextColor3 = Color3.new(1, 1, 1),
+        TextStrokeTransparency = 0,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        Visible = false,
+    }, container)
+
+    Tracked[character] = {
+        Player = player,
+        Character = character,
+        Root = root,
+        Highlight = highlight,
+        Billboard = billboard,
+        Box = box,
+        HealthBackground = healthBackground,
+        HealthBar = healthBar,
+        NameLabel = nameLabel,
+        SkeletonLines = skeletonLines,
+        ThreatArrow = threatArrow,
+    }
+end
+
+local function waitForCharacterEntry(player, character)
+    task.spawn(function()
+        for _ = 1, 20 do
+            if Unloaded or not player.Parent or player.Character ~= character then
+                return
+            end
+
+            if getRoot(character) then
+                createEntry(player, character)
+                return
+            end
+
+            task.wait(0.1)
+        end
+    end)
+end
+
+local lastEntryScan = 0
+local function ensureTrackedCharacters()
+    local now = os.clock()
+    if now - lastEntryScan < 0.25 then
+        return
+    end
+    lastEntryScan = now
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character and not Tracked[player.Character] then
+            createEntry(player, player.Character)
+        end
+    end
+end
+
+local function watchPlayer(player)
+    if player == LocalPlayer then
+        return
+    end
+
+    if player.Character then
+        waitForCharacterEntry(player, player.Character)
+    end
+
+    connect(player.CharacterAdded, function(character)
+        waitForCharacterEntry(player, character)
+    end)
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    watchPlayer(player)
+end
+
+connect(Players.PlayerAdded, watchPlayer)
+connect(Players.PlayerRemoving, function(player)
+    for character, entry in pairs(Tracked) do
+        if entry.Player == player then
+            removeEntry(character)
+        end
+    end
+end)
+
+local espElapsed = 0
+RunService:BindToRenderStep(ESP_BIND_NAME, Enum.RenderPriority.Last.Value - 2, function(dt)
+    espElapsed += dt
+    if espElapsed < 1 / 20 then
+        return
+    end
+    espElapsed = 0
+
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    local localCharacter = LocalPlayer.Character
+    local localRoot = localCharacter and getRoot(localCharacter)
+    local origin = localRoot and localRoot.Position or camera.CFrame.Position
+
+    for character, entry in pairs(Tracked) do
+        local player = entry.Player
+
+        if not player.Parent or player.Character ~= character or not character:IsDescendantOf(workspace) then
+            removeEntry(character)
+            continue
+        end
+
+        local root = getRoot(character)
+        if not root then
+            entry.Highlight.Enabled = false
+            entry.Billboard.Enabled = false
+            entry.ThreatArrow.Visible = false
+            hideSkeleton(entry)
+            continue
+        end
+
+        entry.Root = root
+        entry.Billboard.Adornee = root
+
+        local distance = (root.Position - origin).Magnitude
+        local shouldShow = Config.Players and distance <= Config.ESPDistance and isAlive(character)
+        local selected = Config.CombatESP and SelectedCharacter == character
+
+        entry.Highlight.Enabled = shouldShow and Config.Chams
+        entry.Highlight.FillColor = selected and COLORS.Accent or COLORS.ESP
+        entry.Highlight.OutlineColor = selected and COLORS.Accent or COLORS.ESP
+        entry.Billboard.Enabled = shouldShow
+
+        if not shouldShow then
+            entry.ThreatArrow.Visible = false
+            entry.Box.Visible = false
+            entry.HealthBackground.Visible = false
+            entry.NameLabel.Visible = false
+            hideSkeleton(entry)
+            continue
+        end
+
+        updateThreatArrow(entry, camera, root, distance)
+
+        if Config.Skeleton then
+            updateSkeleton(entry, camera)
+            local fade = Config.CombatESP
+                and math.clamp(distance / math.max(Config.ESPDistance, 1) * 0.7, 0.08, 0.7)
+                or 0
+
+            for _, line in ipairs(entry.SkeletonLines) do
+                line.BackgroundTransparency = selected and 0 or fade
+                line.BackgroundColor3 = selected and COLORS.Accent or COLORS.ESP
+            end
+        else
+            hideSkeleton(entry)
+        end
+
+        entry.Box.Visible = Config.Boxes
+        entry.NameLabel.Visible = Config.Names
+        entry.NameLabel.TextColor3 = selected and COLORS.Accent or Color3.new(1, 1, 1)
+
+        if Config.Names then
+            entry.NameLabel.Text = string.format("%s [%d]", getName(player), math.floor(distance))
+        end
+
+        local health, maxHealth = getHealth(character)
+        if Config.Health and health and maxHealth and maxHealth > 0 then
+            local fraction = math.clamp(health / maxHealth, 0, 1)
+            entry.HealthBackground.Visible = true
+            entry.HealthBar.Size = UDim2.fromScale(1, fraction)
+            entry.HealthBar.BackgroundColor3 = Color3.fromHSV(fraction * 0.33, 1, 1)
+        else
+            entry.HealthBackground.Visible = false
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- Aim guide: circle only; lock-on dot intentionally removed
+------------------------------------------------------------
+
+local AimGui = create("ScreenGui", {
+    Name = "ESP_Build11_AimGuide",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 9999,
+}, PlayerGui)
+
+local AimCircle = create("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundTransparency = 1,
+    Visible = false,
+}, AimGui)
+
+create("UICorner", {
+    CornerRadius = UDim.new(1, 0),
+}, AimCircle)
+
+local AimCircleStroke = create("UIStroke", {
+    Color = COLORS.Accent,
+    Transparency = 0.35,
+    Thickness = 1,
+}, AimCircle)
+
+------------------------------------------------------------
+-- Crosshair editor (visual only; no lock marker)
+------------------------------------------------------------
+
+local CrosshairGui = create("ScreenGui", {
+    Name = "ESP_Build14_Crosshair",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 9998,
+    Enabled = Config.Crosshair,
+}, PlayerGui)
+
+local CrosshairHolder = create("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Size = UDim2.fromOffset(0, 0),
+    BackgroundTransparency = 1,
+}, CrosshairGui)
+
+local CrosshairLines = {}
+for index = 1, 4 do
+    CrosshairLines[index] = create("Frame", {
+        BorderSizePixel = 0,
+        BackgroundColor3 = COLORS.Accent,
+    }, CrosshairHolder)
+end
+
+local CROSSHAIR_COLORS = {
+    Purple = Color3.fromRGB(170, 100, 220),
+    White = Color3.fromRGB(255, 255, 255),
+    Red = Color3.fromRGB(255, 70, 80),
+    Green = Color3.fromRGB(80, 255, 150),
+    Blue = Color3.fromRGB(80, 170, 255),
+    Yellow = Color3.fromRGB(255, 220, 80),
+}
+
+local PanicActive = false
+
+local function refreshAimCircleStyle()
+    if not AimCircleStroke then
+        return
+    end
+    AimCircleStroke.Color = CROSSHAIR_COLORS[Config.AimCircleColor] or COLORS.Accent
+    AimCircleStroke.Thickness = math.clamp(Config.AimCircleThickness or 1, 1, 6)
+end
+
+refreshAimCircleStyle()
+
+local function refreshCrosshair()
+    local camera = workspace.CurrentCamera
+    if not camera or not CrosshairGui or not CrosshairGui.Parent then
+        return
+    end
+
+    CrosshairGui.Enabled = Config.Crosshair and not PanicActive
+    if not CrosshairGui.Enabled then
+        return
+    end
+
+    local viewport = camera.ViewportSize
+    CrosshairHolder.Position = UDim2.fromOffset(viewport.X / 2, viewport.Y / 2)
+
+    local size = math.max(2, Config.CrosshairSize)
+    local thickness = math.max(1, Config.CrosshairThickness)
+    local dynamic = Config.CrosshairDynamic
+        and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+    local gap = math.max(0, Config.CrosshairGap + (dynamic and 4 or 0))
+    local color = CROSSHAIR_COLORS[Config.CrosshairColor] or COLORS.Accent
+
+    local left, right, top, bottom = table.unpack(CrosshairLines)
+    for _, line in ipairs(CrosshairLines) do
+        line.BackgroundColor3 = color
+    end
+
+    left.AnchorPoint = Vector2.new(1, 0.5)
+    left.Position = UDim2.fromOffset(-gap, 0)
+    left.Size = UDim2.fromOffset(size, thickness)
+
+    right.AnchorPoint = Vector2.new(0, 0.5)
+    right.Position = UDim2.fromOffset(gap, 0)
+    right.Size = UDim2.fromOffset(size, thickness)
+
+    top.AnchorPoint = Vector2.new(0.5, 1)
+    top.Position = UDim2.fromOffset(0, -gap)
+    top.Size = UDim2.fromOffset(thickness, size)
+
+    bottom.AnchorPoint = Vector2.new(0.5, 0)
+    bottom.Position = UDim2.fromOffset(0, gap)
+    bottom.Size = UDim2.fromOffset(thickness, size)
+end
+
+RunService:BindToRenderStep(CROSSHAIR_BIND_NAME, Enum.RenderPriority.Last.Value + 2, refreshCrosshair)
+
+------------------------------------------------------------
+-- Performance HUD
+------------------------------------------------------------
+
+local PerformanceGui = create("ScreenGui", {
+    Name = "ESP_Build14_Performance",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 9997,
+    Enabled = Config.PerformanceHUD,
+}, PlayerGui)
+
+local PerformanceShadow = create("Frame", {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -13, 0, 19),
+    Size = UDim2.fromOffset(250, 150),
+    BackgroundColor3 = Color3.new(0, 0, 0),
+    BackgroundTransparency = 0.58,
+    BorderSizePixel = 0,
+    ZIndex = 0,
+}, PerformanceGui)
+create("UICorner", {CornerRadius = UDim.new(0, 13)}, PerformanceShadow)
+
+local PerformanceFrame = create("Frame", {
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -16, 0, 16),
+    Size = UDim2.fromOffset(250, 150),
+    BackgroundColor3 = Color3.fromRGB(17, 15, 23),
+    BackgroundTransparency = 0.06,
+    BorderSizePixel = 0,
+    ZIndex = 1,
+}, PerformanceGui)
+
+create("UICorner", {CornerRadius = UDim.new(0, 13)}, PerformanceFrame)
+create("UIStroke", {
+    Color = Color3.fromRGB(116, 72, 158),
+    Transparency = 0.28,
+    Thickness = 1,
+}, PerformanceFrame)
+
+local AccentBar = create("Frame", {
+    Position = UDim2.fromOffset(1, 1),
+    Size = UDim2.new(1, -2, 0, 3),
+    BackgroundColor3 = COLORS.Accent,
+    BorderSizePixel = 0,
+    ZIndex = 2,
+}, PerformanceFrame)
+create("UICorner", {CornerRadius = UDim.new(0, 12)}, AccentBar)
+create("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(105, 160, 255)),
+        ColorSequenceKeypoint.new(0.5, COLORS.Accent),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(230, 95, 180)),
+    }),
+}, AccentBar)
+
+local PerformanceTitle = create("TextLabel", {
+    Position = UDim2.fromOffset(14, 11),
+    Size = UDim2.fromOffset(145, 20),
+    BackgroundTransparency = 1,
+    Text = "BUILD 14",
+    TextColor3 = Color3.fromRGB(247, 244, 252),
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ZIndex = 2,
+}, PerformanceFrame)
+
+create("TextLabel", {
+    Position = UDim2.fromOffset(14, 30),
+    Size = UDim2.fromOffset(145, 14),
+    BackgroundTransparency = 1,
+    Text = "PERFORMANCE MONITOR",
+    TextColor3 = Color3.fromRGB(150, 143, 165),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ZIndex = 2,
+}, PerformanceFrame)
+
+local LiveBadge = create("Frame", {
+    Position = UDim2.new(1, -72, 0, 15),
+    Size = UDim2.fromOffset(58, 22),
+    BackgroundColor3 = Color3.fromRGB(24, 53, 42),
+    BackgroundTransparency = 0.12,
+    BorderSizePixel = 0,
+    ZIndex = 2,
+}, PerformanceFrame)
+create("UICorner", {CornerRadius = UDim.new(1, 0)}, LiveBadge)
+create("UIStroke", {
+    Color = Color3.fromRGB(76, 205, 139),
+    Transparency = 0.55,
+    Thickness = 1,
+}, LiveBadge)
+local LiveDot = create("Frame", {
+    AnchorPoint = Vector2.new(0, 0.5),
+    Position = UDim2.new(0, 9, 0.5, 0),
+    Size = UDim2.fromOffset(6, 6),
+    BackgroundColor3 = Color3.fromRGB(88, 230, 151),
+    BorderSizePixel = 0,
+    ZIndex = 3,
+}, LiveBadge)
+create("UICorner", {CornerRadius = UDim.new(1, 0)}, LiveDot)
+create("TextLabel", {
+    Position = UDim2.fromOffset(20, 0),
+    Size = UDim2.new(1, -24, 1, 0),
+    BackgroundTransparency = 1,
+    Text = "LIVE",
+    TextColor3 = Color3.fromRGB(126, 237, 177),
+    Font = Enum.Font.GothamBold,
+    TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ZIndex = 3,
+}, LiveBadge)
+
+create("Frame", {
+    Position = UDim2.fromOffset(14, 53),
+    Size = UDim2.new(1, -28, 0, 1),
+    BackgroundColor3 = Color3.fromRGB(72, 64, 85),
+    BackgroundTransparency = 0.45,
+    BorderSizePixel = 0,
+    ZIndex = 2,
+}, PerformanceFrame)
+
+local MetricPositions = {
+    Vector2.new(12, 62),
+    Vector2.new(129, 62),
+    Vector2.new(12, 104),
+    Vector2.new(129, 104),
+}
+local metricIndex = 0
+
+local function makeHudLabel(text, y, bold)
+    if bold then
+        return PerformanceTitle
+    end
+
+    metricIndex += 1
+    local position = MetricPositions[metricIndex] or Vector2.new(12, 62)
+    local label = string.match(text, "^[^:]+") or text
+    local card = create("Frame", {
+        Position = UDim2.fromOffset(position.X, position.Y),
+        Size = UDim2.fromOffset(109, 34),
+        BackgroundColor3 = Color3.fromRGB(29, 26, 38),
+        BackgroundTransparency = 0.08,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    }, PerformanceFrame)
+    create("UICorner", {CornerRadius = UDim.new(0, 8)}, card)
+    create("UIStroke", {
+        Color = Color3.fromRGB(82, 74, 96),
+        Transparency = 0.62,
+        Thickness = 1,
+    }, card)
+
+    create("TextLabel", {
+        Position = UDim2.fromOffset(9, 0),
+        Size = UDim2.fromOffset(46, 34),
+        BackgroundTransparency = 1,
+        Text = label,
+        TextColor3 = Color3.fromRGB(145, 137, 158),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 3,
+    }, card)
+
+    return create("TextLabel", {
+        Position = UDim2.fromOffset(43, 0),
+        Size = UDim2.new(1, -51, 1, 0),
+        BackgroundTransparency = 1,
+        Text = "--",
+        TextColor3 = Color3.fromRGB(242, 239, 247),
+        Font = Enum.Font.Code,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        ZIndex = 3,
+    }, card)
+end
+
+local PerfTitle = makeHudLabel("BUILD 14 • LIVE", 7, true)
+local PerfFps = makeHudLabel("FPS: --", 28, false)
+local PerfPing = makeHudLabel("PING: --", 45, false)
+local PerfMemory = makeHudLabel("MEM: --", 62, false)
+local PerfSession = makeHudLabel("SESSION: 00:00", 79, false)
+
+local SessionStarted = os.clock()
+local perfFrames = 0
+local perfElapsed = 0
+local HUD_GOOD = Color3.fromRGB(96, 232, 157)
+local HUD_WARN = Color3.fromRGB(255, 204, 92)
+local HUD_BAD = Color3.fromRGB(255, 102, 119)
+local HUD_NEUTRAL = Color3.fromRGB(222, 215, 232)
+
+local function performanceColor(value, goodLimit, warningLimit, lowerIsBetter)
+    if lowerIsBetter then
+        if value <= goodLimit then return HUD_GOOD end
+        if value <= warningLimit then return HUD_WARN end
+        return HUD_BAD
+    end
+
+    if value >= goodLimit then return HUD_GOOD end
+    if value >= warningLimit then return HUD_WARN end
+    return HUD_BAD
+end
+
+connect(RunService.RenderStepped, function(dt)
+    perfFrames += 1
+    perfElapsed += dt
+
+    if PerformanceGui then
+        PerformanceGui.Enabled = Config.PerformanceHUD and not PanicActive
+    end
+
+    if perfElapsed < 0.5 then
+        return
+    end
+
+    local fps = math.floor(perfFrames / math.max(perfElapsed, 0.001) + 0.5)
+    perfFrames = 0
+    perfElapsed = 0
+
+    local pingText = "--"
+    pcall(function()
+        local item = Stats.Network.ServerStatsItem["Data Ping"]
+        if item then
+            pingText = item:GetValueString()
+        end
+    end)
+
+    local memory = 0
+    pcall(function()
+        memory = Stats:GetTotalMemoryUsageMb()
+    end)
+
+    local totalSeconds = math.floor(os.clock() - SessionStarted)
+    local hours = math.floor(totalSeconds / 3600)
+    local minutes = math.floor(totalSeconds / 60) % 60
+    local seconds = totalSeconds % 60
+    local pingNumber = tonumber(string.match(tostring(pingText), "[%d%.]+"))
+
+    PerfFps.Text = tostring(fps)
+    PerfFps.TextColor3 = performanceColor(fps, 55, 30, false)
+
+    PerfPing.Text = tostring(pingText)
+    PerfPing.TextColor3 = pingNumber and performanceColor(pingNumber, 80, 150, true) or HUD_NEUTRAL
+
+    PerfMemory.Text = string.format("%.0f MB", memory)
+    PerfMemory.TextColor3 = HUD_NEUTRAL
+
+    PerfSession.Text = hours > 0
+        and string.format("%02d:%02d:%02d", hours, minutes, seconds)
+        or string.format("%02d:%02d", minutes, seconds)
+    PerfSession.TextColor3 = Color3.fromRGB(190, 157, 235)
+end)
+
+------------------------------------------------------------
+-- Spectate helpers
+------------------------------------------------------------
+
+local SelectedPlayerName = nil
+local SpectatingPlayer = nil
+local SpectateOriginalSubject = nil
+
+local function getPlayerByName(name)
+    if not name then
+        return nil
+    end
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Name == name then
+            return player
+        end
+    end
+    return nil
+end
+
+local function playerNameOptions()
+    local names = {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            table.insert(names, player.Name)
+        end
+    end
+    table.sort(names, function(a, b)
+        return string.lower(a) < string.lower(b)
+    end)
+    if #names == 0 then
+        table.insert(names, "<no players>")
+    end
+    return names
+end
+
+local function stopSpectating()
+    local camera = workspace.CurrentCamera
+    if camera then
+        local localCharacter = LocalPlayer.Character
+        local humanoid = getHumanoid(localCharacter)
+        local root = getRoot(localCharacter)
+        camera.CameraSubject = humanoid or root or SpectateOriginalSubject
+    end
+    SpectatingPlayer = nil
+    SpectateOriginalSubject = nil
+end
+
+local function spectatePlayer(player)
+    if not player or player == LocalPlayer then
+        return false
+    end
+
+    local camera = workspace.CurrentCamera
+    local character = player.Character
+    local humanoid = getHumanoid(character)
+    local root = getRoot(character)
+    if not camera or not character or not (humanoid or root) then
+        return false
+    end
+
+    if not SpectatingPlayer then
+        SpectateOriginalSubject = camera.CameraSubject
+    end
+
+    camera.CameraSubject = humanoid or root
+    SpectatingPlayer = player
+    return true
+end
+
+local AIM_BODY_PARTS = {
+    "Head",
+    "UpperTorso",
+    "LowerTorso",
+    "Torso",
+    "LeftUpperArm",
+    "LeftLowerArm",
+    "LeftHand",
+    "RightUpperArm",
+    "RightLowerArm",
+    "RightHand",
+    "LeftUpperLeg",
+    "LeftLowerLeg",
+    "LeftFoot",
+    "RightUpperLeg",
+    "RightLowerLeg",
+    "RightFoot",
+    "Left Arm",
+    "Right Arm",
+    "Left Leg",
+    "Right Leg",
+    "HumanoidRootPart",
+}
+
+local TARGET_MAP = {
+    Head = {"Head", "UpperTorso", "Torso", "HumanoidRootPart"},
+    Torso = {"UpperTorso", "Torso", "LowerTorso", "HumanoidRootPart"},
+    ["Left Arm"] = {"LeftUpperArm", "LeftLowerArm", "LeftHand", "Left Arm"},
+    ["Right Arm"] = {"RightUpperArm", "RightLowerArm", "RightHand", "Right Arm"},
+    ["Left Leg"] = {"LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "Left Leg"},
+    ["Right Leg"] = {"RightUpperLeg", "RightLowerLeg", "RightFoot", "Right Leg"},
+}
+
+local AimRayParams = RaycastParams.new()
+AimRayParams.FilterType = Enum.RaycastFilterType.Exclude
+AimRayParams.IgnoreWater = true
+
+local function projectedPoint(camera, worldPosition)
+    local point, onScreen = camera:WorldToScreenPoint(worldPosition)
+    if not onScreen or point.Z <= 0 then
+        return nil
+    end
+    return Vector2.new(point.X, point.Y), point.Z
+end
+
+local function targetPartForCharacter(character, camera, cursor)
+    if Config.AimTarget == "Closest" then
+        local bestPart = nil
+        local bestScreenDistance = math.huge
+
+        for _, name in ipairs(AIM_BODY_PARTS) do
+            local part = character:FindFirstChild(name)
+            if part and part:IsA("BasePart") then
+                local point = projectedPoint(camera, part.Position)
+                if point then
+                    local screenDistance = (point - cursor).Magnitude
+                    if screenDistance < bestScreenDistance then
+                        bestScreenDistance = screenDistance
+                        bestPart = part
+                    end
+                end
+            end
+        end
+
+        return bestPart, bestScreenDistance
+    end
+
+    local names = TARGET_MAP[Config.AimTarget] or TARGET_MAP.Head
+    for _, name in ipairs(names) do
+        local part = character:FindFirstChild(name)
+        if part and part:IsA("BasePart") then
+            local point = projectedPoint(camera, part.Position)
+            if point then
+                return part, (point - cursor).Magnitude
+            end
+        end
+    end
+
+    return nil, math.huge
+end
+
+local function visibleFromCamera(camera, ownCharacter, targetCharacter, worldPosition)
+    local origin = camera.CFrame.Position
+    local direction = worldPosition - origin
+
+    if direction.Magnitude < 0.01 then
+        return true
+    end
+
+    AimRayParams.FilterDescendantsInstances = ownCharacter and {ownCharacter} or {}
+
+    local result = workspace:Raycast(origin, direction, AimRayParams)
+    if not result then
+        return true
+    end
+
+    return result.Instance and result.Instance:IsDescendantOf(targetCharacter)
+end
+
+local function currentAimDistanceLimit()
+    if Config.InfiniteAimRange then
+        return math.huge
+    end
+    return Config.AimMaxDistance
+end
+
+local function evaluateCharacter(player, character, camera, cursor, origin, ownCharacter)
+    if player == LocalPlayer or sameTeam(player) or not isAlive(character) then
+        return nil
+    end
+
+    local root = getRoot(character)
+    if not root then
+        return nil
+    end
+
+    local worldDistance = (root.Position - origin).Magnitude
+    if worldDistance > currentAimDistanceLimit() then
+        return nil
+    end
+
+    local part, screenDistance = targetPartForCharacter(character, camera, cursor)
+    if not part or screenDistance > Config.AimRadius then
+        return nil
+    end
+
+    if Config.AimFrontOnly then
+        local directionToPart = part.Position - camera.CFrame.Position
+        if directionToPart.Magnitude > 0.01 then
+            local frontAngle = math.clamp(Config.AimFrontAngle or 75, 10, 89)
+            local minimumDot = math.cos(math.rad(frontAngle))
+            if camera.CFrame.LookVector:Dot(directionToPart.Unit) < minimumDot then
+                return nil
+            end
+        end
+    end
+
+    local aimPosition = part.Position
+    if Config.AimPrediction then
+        aimPosition += part.AssemblyLinearVelocity * Config.AimLeadTime
+    end
+
+    local predictedPoint = projectedPoint(camera, aimPosition)
+    if not predictedPoint then
+        return nil
+    end
+
+    local predictedScreenDistance = (predictedPoint - cursor).Magnitude
+    if predictedScreenDistance > Config.AimRadius then
+        return nil
+    end
+
+    if not visibleFromCamera(camera, ownCharacter, character, aimPosition) then
+        return nil
+    end
+
+    return {
+        Player = player,
+        Character = character,
+        Part = part,
+        Position = aimPosition,
+        ScreenDistance = predictedScreenDistance,
+        WorldDistance = worldDistance,
+    }
+end
+
+local function findBestTarget(camera, cursor, origin, ownCharacter)
+    ensureTrackedCharacters()
+
+    local now = os.clock()
+    local scanInterval = math.clamp(Config.AimScanInterval or 1, 0.1, 5)
+
+    -- Re-evaluate the cached target every frame so aim movement stays smooth,
+    -- but only search the full player list at the configured scan interval.
+    if now < TargetScanNextAt then
+        if TargetScanCharacter then
+            local cachedEntry = Tracked[TargetScanCharacter]
+            if cachedEntry and cachedEntry.Player and cachedEntry.Player.Parent
+                and cachedEntry.Player.Character == TargetScanCharacter then
+                local cached = evaluateCharacter(
+                    cachedEntry.Player,
+                    TargetScanCharacter,
+                    camera,
+                    cursor,
+                    origin,
+                    ownCharacter
+                )
+                if cached then
+                    return cached
+                end
+            end
+        end
+        return nil
+    end
+
+    TargetScanNextAt = now + scanInterval
+    local best = nil
+
+    if Config.AimLock and LockedCharacter then
+        local entry = Tracked[LockedCharacter]
+        if entry and entry.Player and entry.Player.Parent and entry.Player.Character == LockedCharacter then
+            local locked = evaluateCharacter(entry.Player, LockedCharacter, camera, cursor, origin, ownCharacter)
+            if locked then
+                TargetScanCharacter = LockedCharacter
+                return locked
+            end
+        end
+        LockedCharacter = nil
+    end
+
+    for character, entry in pairs(Tracked) do
+        if entry.Player and entry.Player.Parent and entry.Player.Character == character then
+            local candidate = evaluateCharacter(entry.Player, character, camera, cursor, origin, ownCharacter)
+            if candidate then
+                if not best
+                    or candidate.ScreenDistance < best.ScreenDistance
+                    or (candidate.ScreenDistance == best.ScreenDistance and candidate.WorldDistance < best.WorldDistance) then
+                    best = candidate
+                end
+            end
+        end
+    end
+
+    if best and Config.AimLock then
+        LockedCharacter = best.Character
+    end
+
+    TargetScanCharacter = best and best.Character or nil
+
+    return best
+end
+
+local preCameraCFrame = nil
+
+RunService:BindToRenderStep(RECOIL_CAPTURE_BIND_NAME, Enum.RenderPriority.Camera.Value - 1, function()
+    local camera = workspace.CurrentCamera
+    preCameraCFrame = camera and camera.CFrame or nil
+end)
+
+RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Last.Value + 3, function(dt)
+    local camera = workspace.CurrentCamera
+    local mouse = UserInputService:GetMouseLocation()
+
+    if camera and Config.CameraRecoilDamping and preCameraCFrame
+        and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+
+        local beforePitch = math.asin(math.clamp(preCameraCFrame.LookVector.Y, -1, 1))
+        local afterPitch = math.asin(math.clamp(camera.CFrame.LookVector.Y, -1, 1))
+        local upwardKick = afterPitch - beforePitch
+
+        if upwardKick > math.rad(0.3) and upwardKick < math.rad(10) then
+            local pitch = afterPitch - math.min(upwardKick, math.rad(4)) * Config.RecoilStrength
+            local look = camera.CFrame.LookVector
+            local yaw = math.atan2(-look.X, -look.Z)
+            local adjustedLook = Vector3.new(
+                -math.sin(yaw) * math.cos(pitch),
+                math.sin(pitch),
+                -math.cos(yaw) * math.cos(pitch)
+            )
+            camera.CFrame = CFrame.lookAt(camera.CFrame.Position, camera.CFrame.Position + adjustedLook)
+        end
+    end
+
+    AimCircle.Visible = Config.AimAssist and Config.AimCircleVisible and not PanicActive
+    SelectedCharacter = nil
+
+    if not camera or not Config.AimAssist then
+        LockedCharacter = nil
+        AimCandidateCharacter = nil
+        TargetScanCharacter = nil
+        TargetScanNextAt = 0
+        return
+    end
+
+    AimCircle.Position = UDim2.fromOffset(mouse.X, mouse.Y)
+    AimCircle.Size = UDim2.fromOffset(Config.AimRadius * 2, Config.AimRadius * 2)
+
+    if not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+        or UserInputService:GetFocusedTextBox() then
+        LockedCharacter = nil
+        AimCandidateCharacter = nil
+        TargetScanCharacter = nil
+        TargetScanNextAt = 0
+        return
+    end
+
+    local ownCharacter = LocalPlayer.Character
+    local ownRoot = ownCharacter and getRoot(ownCharacter)
+    local origin = ownRoot and ownRoot.Position or camera.CFrame.Position
+    local target = findBestTarget(camera, mouse, origin, ownCharacter)
+
+    if not target then
+        AimCandidateCharacter = nil
+        TargetScanCharacter = nil
+        return
+    end
+
+    SelectedCharacter = target.Character
+
+    local aimStrength = math.clamp(Config.AimStrength, 0.01, 1)
+    local aimFollowSpeed = math.clamp(Config.AimFollowSpeed or 100, 10, 100) / 100
+    local aimTurnSpeed = Config.AimTurnSpeed
+
+    if Config.AimMode == "Legit" then
+        if AimCandidateCharacter ~= target.Character then
+            AimCandidateCharacter = target.Character
+            AimCandidateSince = os.clock()
+            return
+        end
+
+        if os.clock() - AimCandidateSince < math.max(Config.LegitReactionTime, 0) then
+            return
+        end
+
+        -- Keep the final movement smooth and capped, even if aggressive
+        -- slider values were previously saved in the profile.
+        aimStrength = math.min(aimStrength, 0.16)
+        aimTurnSpeed = math.min(aimTurnSpeed, 240)
+    else
+        AimCandidateCharacter = nil
+    end
+
+    local targetCFrame = CFrame.lookAt(camera.CFrame.Position, target.Position)
+
+    if Config.SmoothAim then
+        local currentLook = camera.CFrame.LookVector
+        local desiredLook = (target.Position - camera.CFrame.Position).Unit
+        local angle = math.acos(math.clamp(currentLook:Dot(desiredLook), -1, 1))
+
+        if angle > 0.0001 then
+            if Config.AimMode == "Legit" and angle < math.rad(0.25) then
+                return
+            end
+
+            local strengthStep = angle * aimStrength * aimFollowSpeed
+            local turnStep = math.rad(aimTurnSpeed) * aimFollowSpeed * math.max(dt, 1 / 240)
+            local step = math.min(strengthStep, turnStep)
+            local alpha = math.clamp(step / angle, 0, 1)
+            camera.CFrame = camera.CFrame:Lerp(targetCFrame, alpha)
+        end
+    else
+        camera.CFrame = camera.CFrame:Lerp(targetCFrame, aimStrength * aimFollowSpeed)
+    end
+end)
+
+------------------------------------------------------------
+-- FOV override
+------------------------------------------------------------
+
+local FOV = {
+    Original = workspace.CurrentCamera and workspace.CurrentCamera.FieldOfView or 70,
+    Value = workspace.CurrentCamera and workspace.CurrentCamera.FieldOfView or 70,
+    Active = false,
+    CameraConnection = nil,
+}
+
+local function applyFov()
+    if not FOV.Active then
+        return
+    end
+
+    local camera = workspace.CurrentCamera
+    if camera and math.abs(camera.FieldOfView - FOV.Value) > 0.01 then
+        camera.FieldOfView = FOV.Value
+    end
+end
+
+local function watchFovCamera(camera)
+    if FOV.CameraConnection then
+        FOV.CameraConnection:Disconnect()
+        FOV.CameraConnection = nil
+    end
+
+    if camera then
+        FOV.CameraConnection = connect(camera:GetPropertyChangedSignal("FieldOfView"), applyFov)
+    end
+end
+
+watchFovCamera(workspace.CurrentCamera)
+
+connect(workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    watchFovCamera(camera)
+
+    if FOV.Active then
+        applyFov()
+    else
+        FOV.Original = camera.FieldOfView
+        FOV.Value = camera.FieldOfView
+    end
+end)
+
+RunService:BindToRenderStep(FOV_BIND_NAME, Enum.RenderPriority.Last.Value + 1, applyFov)
+
+local function setFov(value)
+    FOV.Value = math.floor(math.clamp(value, 30, 120) + 0.5)
+    FOV.Active = true
+    applyFov()
+end
+
+local function resetFov()
+    FOV.Active = false
+    local camera = workspace.CurrentCamera
+    if camera and FOV.Original then
+        pcall(function()
+            camera.FieldOfView = FOV.Original
+        end)
+    end
+    FOV.Value = FOV.Original or 70
+end
+
+------------------------------------------------------------
+-- Custom cursor
+------------------------------------------------------------
+
+local Cursor = {
+    Enabled = false,
+    Gui = nil,
+    Holder = nil,
+    Scale = nil,
+    Lines = {},
+    Glow = {},
+    Pressed = false,
+    OriginalIcon = UserInputService.MouseIconEnabled,
+}
+
+local CURSOR_THICKNESS = 2
+local CURSOR_COLOR = Color3.fromRGB(255, 45, 60)
+local CURSOR_CORE = Color3.fromRGB(255, 225, 228)
+local CURSOR_PRESSED_COLOR = Color3.new(1, 1, 1)
+local CURSOR_GLOW_COLOR = Color3.fromRGB(255, 30, 55)
+local CURSOR_PULSE_SPEED = 2.5
+local CURSOR_PULSE_AMOUNT = 0.06
+
+local CURSOR_GLOW = {
+    {18, 0.95},
+    {12, 0.90},
+    {8, 0.82},
+    {5, 0.68},
+    {2.5, 0.45},
+}
+
+local CURSOR_POINTS = {
+    Vector2.new(0, 0),
+    Vector2.new(30, 11),
+    Vector2.new(14, 15),
+    Vector2.new(11, 30),
+}
+
+local function getCursorParent()
+    -- Hidden UI containers used by many executors render above Rayfield and
+    -- other PlayerGui ScreenGuis. Fall back to PlayerGui for compatibility.
+    if type(gethui) == "function" then
+        local ok, hiddenGui = pcall(gethui)
+        if ok and typeof(hiddenGui) == "Instance" then
+            return hiddenGui
+        end
+    end
+    return PlayerGui
+end
+
+local function cursorLine(parent, p1, p2, color, thickness, transparency, zIndex, rounded, isCore)
+    local delta = p2 - p1
+    local length = delta.Magnitude
+    local middle = (p1 + p2) / 2
+
+    local line = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromOffset(middle.X, middle.Y),
+        Size = UDim2.fromOffset(length + (rounded and thickness or thickness * 0.5), thickness),
+        Rotation = math.deg(math.atan2(delta.Y, delta.X)),
+        BackgroundColor3 = color,
+        BackgroundTransparency = transparency,
+        BorderSizePixel = 0,
+        ZIndex = zIndex,
+    }, parent)
+
+    if rounded then
+        create("UICorner", {
+            CornerRadius = UDim.new(1, 0),
+        }, line)
+    end
+
+    if isCore then
+        table.insert(Cursor.Lines, {Frame = line, Color = color})
+    else
+        table.insert(Cursor.Glow, {Frame = line, Transparency = transparency})
+    end
+
+    return line
+end
+
+local function drawCursorSegment(p1, p2, thickness)
+    for layer, glow in ipairs(CURSOR_GLOW) do
+        cursorLine(Cursor.Holder, p1, p2, CURSOR_GLOW_COLOR, thickness + glow[1], glow[2], layer, true, false)
+    end
+
+    local top = #CURSOR_GLOW
+    cursorLine(Cursor.Holder, p1, p2, CURSOR_COLOR, thickness, 0, top + 1, false, true)
+    cursorLine(Cursor.Holder, p1, p2, CURSOR_CORE, 1, 0, top + 2, false, true)
+end
+
+local function buildCursor()
+    Cursor.Gui = create("ScreenGui", {
+        Name = "ESP_Build11_Cursor",
+        ResetOnSpawn = false,
+        IgnoreGuiInset = true,
+        DisplayOrder = 1000000,
+        ZIndexBehavior = Enum.ZIndexBehavior.Global,
+        Enabled = false,
+    }, getCursorParent())
+
+    Cursor.Holder = create("Frame", {
+        Size = UDim2.fromOffset(0, 0),
+        BackgroundTransparency = 1,
+    }, Cursor.Gui)
+
+    Cursor.Scale = create("UIScale", {
+        Scale = 1,
+    }, Cursor.Holder)
+
+    for index = 1, #CURSOR_POINTS do
+        drawCursorSegment(CURSOR_POINTS[index], CURSOR_POINTS[index % #CURSOR_POINTS + 1], CURSOR_THICKNESS)
+    end
+end
+
+local function setCursorPressed(pressed)
+    if not Cursor.Holder or Cursor.Pressed == pressed then
+        return
+    end
+
+    Cursor.Pressed = pressed
+    Cursor.Scale.Scale = pressed and 0.85 or 1
+
+    for _, line in ipairs(Cursor.Lines) do
+        line.Frame.BackgroundColor3 = pressed and CURSOR_PRESSED_COLOR or line.Color
+    end
+end
+
+local function updateCursor()
+    if not Cursor.Enabled or not Cursor.Holder then
+        return
+    end
+
+    if UserInputService.MouseIconEnabled then
+        UserInputService.MouseIconEnabled = false
+    end
+
+    local position = UserInputService:GetMouseLocation()
+    Cursor.Holder.Position = UDim2.fromOffset(position.X, position.Y)
+
+    if CURSOR_PULSE_AMOUNT > 0 then
+        local pulse = (math.sin(os.clock() * CURSOR_PULSE_SPEED) + 1) * 0.5 * CURSOR_PULSE_AMOUNT
+        for _, glow in ipairs(Cursor.Glow) do
+            glow.Frame.BackgroundTransparency = math.clamp(glow.Transparency + pulse, 0, 1)
+        end
+    end
+end
+
+local function setCursor(enabled)
+    if enabled == Cursor.Enabled then
+        return
+    end
+
+    Cursor.Enabled = enabled
+
+    if enabled then
+        if not Cursor.Gui then
+            buildCursor()
+        end
+
+        Cursor.OriginalIcon = UserInputService.MouseIconEnabled
+        Cursor.Gui.Enabled = true
+        RunService:BindToRenderStep(CURSOR_BIND_NAME, Enum.RenderPriority.Last.Value + 4, updateCursor)
+        updateCursor()
+    else
+        pcall(function()
+            RunService:UnbindFromRenderStep(CURSOR_BIND_NAME)
+        end)
+
+        if Cursor.Gui then
+            Cursor.Gui.Enabled = false
+        end
+
+        setCursorPressed(false)
+        UserInputService.MouseIconEnabled = Cursor.OriginalIcon ~= false
+    end
+end
+
+connect(UserInputService.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        setCursorPressed(true)
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        setCursorPressed(false)
+    end
+end)
+
+setCursor(Config.Cursor)
+
+------------------------------------------------------------
+-- Movement
+------------------------------------------------------------
+
+local OriginalWalkSpeeds = setmetatable({}, {__mode = "k"})
+local OriginalCanCollide = setmetatable({}, {__mode = "k"})
+local FlyHumanoid = nil
+
+local function restoreMovement()
+    for humanoid, walkSpeed in pairs(OriginalWalkSpeeds) do
+        if humanoid and humanoid.Parent then
+            pcall(function()
+                humanoid.WalkSpeed = walkSpeed
+            end)
+        end
+    end
+    table.clear(OriginalWalkSpeeds)
+
+    if FlyHumanoid and FlyHumanoid.Parent then
+        FlyHumanoid.PlatformStand = false
+    end
+    FlyHumanoid = nil
+end
+
+local function restoreNoclip()
+    for part, canCollide in pairs(OriginalCanCollide) do
+        if part and part.Parent then
+            pcall(function()
+                part.CanCollide = canCollide
+            end)
+        end
+    end
+    table.clear(OriginalCanCollide)
+end
+
+local function updateNoclip(character)
+    if not Config.Noclip or not character then
+        restoreNoclip()
+        return
+    end
+
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("BasePart") then
+            if OriginalCanCollide[object] == nil then
+                OriginalCanCollide[object] = object.CanCollide
+            end
+            object.CanCollide = false
+        end
+    end
+end
+
+RunService:BindToRenderStep(MOVEMENT_BIND_NAME, Enum.RenderPriority.Character.Value + 1, function(dt)
+    local character = LocalPlayer.Character
+    local humanoid = getHumanoid(character)
+    local root = getRoot(character)
+
+    updateNoclip(character)
+
+    if humanoid then
+        if Config.WalkSpeedEnabled then
+            if OriginalWalkSpeeds[humanoid] == nil then
+                OriginalWalkSpeeds[humanoid] = humanoid.WalkSpeed
+            end
+            humanoid.WalkSpeed = Config.WalkSpeed
+        elseif OriginalWalkSpeeds[humanoid] ~= nil then
+            humanoid.WalkSpeed = OriginalWalkSpeeds[humanoid]
+            OriginalWalkSpeeds[humanoid] = nil
+        end
+    end
+
+    if not Config.Fly or not humanoid or not root then
+        if FlyHumanoid and FlyHumanoid.Parent then
+            FlyHumanoid.PlatformStand = false
+        end
+        FlyHumanoid = nil
+        return
+    end
+
+    FlyHumanoid = humanoid
+    humanoid.PlatformStand = true
+
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    local forward = Vector3.new(camera.CFrame.LookVector.X, 0, camera.CFrame.LookVector.Z)
+    local right = Vector3.new(camera.CFrame.RightVector.X, 0, camera.CFrame.RightVector.Z)
+
+    if forward.Magnitude > 0.001 then
+        forward = forward.Unit
+    end
+    if right.Magnitude > 0.001 then
+        right = right.Unit
+    end
+
+    local direction = Vector3.zero
+
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+        direction += forward
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+        direction -= forward
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+        direction += right
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+        direction -= right
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+        direction += Vector3.yAxis
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Q) then
+        direction -= Vector3.yAxis
+    end
+
+    if direction.Magnitude > 1 then
+        direction = direction.Unit
+    end
+
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+
+    if direction.Magnitude > 0 then
+        root.CFrame += direction * Config.FlySpeed * dt
+    end
+end)
+
+------------------------------------------------------------
+-- Rayfield Gen2 UI • build 14 controls
+------------------------------------------------------------
+
+local aimPresets = {
+    {AimRadius = 150, AimStrength = 0.16, AimFollowSpeed = 100, AimTarget = "Head", AimLeadTime = 0.10, AimTurnSpeed = 240},
+    {AimRadius = 110, AimStrength = 0.12, AimFollowSpeed = 85, AimTarget = "Torso", AimLeadTime = 0.10, AimTurnSpeed = 200},
+    {AimRadius = 75, AimStrength = 0.10, AimFollowSpeed = 70, AimTarget = "Head", AimLeadTime = 0.15, AimTurnSpeed = 160},
+}
+local activePreset = 1
+
+local function safeSet(control, value)
+    if control and type(control.Set) == "function" then
+        pcall(function()
+            control:Set(value)
+        end)
+    end
+end
+
+local notify
+local StandardAimSnapshot = nil
+local LEGIT_AIM_DEFAULTS = {
+    AimRadius = 150,
+    AimStrength = 0.14,
+    AimFollowSpeed = 75,
+    AimTurnSpeed = 220,
+    AimTarget = "Head",
+    AimLeadTime = 0.08,
+    AimPrediction = false,
+    AimLock = true,
+    SmoothAim = true,
+    CameraRecoilDamping = false,
+    LegitReactionTime = 0.06,
+    AimFrontOnly = true,
+    AimFrontAngle = 80,
+    AimScanInterval = 0.25,
+}
+
+local STANDARD_AIM_DEFAULTS = {
+    AimRadius = 150,
+    AimStrength = 0.16,
+    AimFollowSpeed = 100,
+    AimTurnSpeed = 240,
+    AimTarget = "Head",
+    AimLeadTime = 0.10,
+    AimPrediction = false,
+    AimLock = true,
+    SmoothAim = true,
+    CameraRecoilDamping = false,
+    LegitReactionTime = 0.12,
+}
+
+local function captureAimSettings()
+    return {
+        AimRadius = Config.AimRadius,
+        AimStrength = Config.AimStrength,
+        AimFollowSpeed = Config.AimFollowSpeed,
+        AimTurnSpeed = Config.AimTurnSpeed,
+        AimTarget = Config.AimTarget,
+        AimLeadTime = Config.AimLeadTime,
+        AimPrediction = Config.AimPrediction,
+        AimLock = Config.AimLock,
+        SmoothAim = Config.SmoothAim,
+        CameraRecoilDamping = Config.CameraRecoilDamping,
+        LegitReactionTime = Config.LegitReactionTime,
+        AimFrontOnly = Config.AimFrontOnly,
+        AimFrontAngle = Config.AimFrontAngle,
+        AimScanInterval = Config.AimScanInterval,
+    }
+end
+
+local function refreshAimControls()
+    safeSet(Controls.AimRadius, Config.AimRadius)
+    safeSet(Controls.AimStrength, math.floor(Config.AimStrength * 100 + 0.5))
+    safeSet(Controls.AimFollowSpeed, Config.AimFollowSpeed)
+    safeSet(Controls.AimTurnSpeed, Config.AimTurnSpeed)
+    safeSet(Controls.AimTarget, Config.AimTarget)
+    safeSet(Controls.AimLeadTime, math.floor(Config.AimLeadTime * 1000 + 0.5))
+    safeSet(Controls.AimLock, Config.AimLock)
+    safeSet(Controls.AimPrediction, Config.AimPrediction)
+    safeSet(Controls.SmoothAim, Config.SmoothAim)
+    safeSet(Controls.CameraRecoilDamping, Config.CameraRecoilDamping)
+    safeSet(Controls.LegitReactionTime, math.floor(Config.LegitReactionTime * 1000 + 0.5))
+    safeSet(Controls.AimFrontOnly, Config.AimFrontOnly)
+    safeSet(Controls.AimFrontAngle, Config.AimFrontAngle)
+    safeSet(Controls.AimScanInterval, math.floor(Config.AimScanInterval * 1000 + 0.5))
+end
+
+local function setAimMode(mode)
+    if mode == "Legit" then
+        if not StandardAimSnapshot then
+            StandardAimSnapshot = captureAimSettings()
+        end
+
+        for setting, value in pairs(LEGIT_AIM_DEFAULTS) do
+            Config[setting] = value
+        end
+    elseif mode == "Standard" then
+        if StandardAimSnapshot then
+            for setting, value in pairs(StandardAimSnapshot) do
+                Config[setting] = value
+            end
+            StandardAimSnapshot = nil
+        end
+    else
+        return
+    end
+
+    Config.AimMode = mode
+    LockedCharacter = nil
+    AimCandidateCharacter = nil
+    TargetScanCharacter = nil
+    TargetScanNextAt = 0
+    refreshAimControls()
+end
+
+local function applyStandardRecommended()
+    setAimMode("Standard")
+    for setting, value in pairs(STANDARD_AIM_DEFAULTS) do
+        Config[setting] = value
+    end
+    LockedCharacter = nil
+    AimCandidateCharacter = nil
+    refreshAimControls()
+    safeSet(Controls.AimMode, "Standard")
+end
+
+local function applyLegitRecommended()
+    setAimMode("Legit")
+    safeSet(Controls.AimMode, "Legit")
+end
+
+local SessionConfigBackup = nil
+
+local function copyConfig()
+    local copy = {}
+    for key, value in pairs(Config) do
+        copy[key] = value
+    end
+    return copy
+end
+
+local function restoreSessionConfig()
+    if not SessionConfigBackup then
+        return false
+    end
+
+    StandardAimSnapshot = nil
+    for key, value in pairs(SessionConfigBackup) do
+        Config[key] = value
+    end
+
+    LockedCharacter = nil
+    AimCandidateCharacter = nil
+    refreshAimControls()
+
+    if Fullbright.Enabled ~= Config.Fullbright then
+        setFullbright(Config.Fullbright)
+    end
+    setCursor(UiVisible and Config.Cursor)
+    refreshCrosshair()
+    return true
+end
+
+local function saveConfigNow()
+    SessionConfigBackup = copyConfig()
+
+    if not RayfieldConfigEnabled then
+        notify("Profiles", "Saved for this session; file storage is unavailable")
+        return true
+    end
+
+    local ok, result = pcall(function()
+        return Window:Save()
+    end)
+    if ok and result ~= false then
+        notify("Profiles", "Default profile saved")
+        return true
+    end
+
+    notify("Profiles", "File save failed; session backup kept")
+    return false
+end
+
+local function loadConfigNow()
+    if RayfieldConfigEnabled then
+        local ok, result = pcall(function()
+            return Window:Load()
+        end)
+        if ok and result ~= false then
+            notify("Profiles", "Default profile loaded")
+            return true
+        end
+    end
+
+    if restoreSessionConfig() then
+        notify("Profiles", "Session backup restored")
+        return true
+    end
+
+    notify("Profiles", "No saved profile is available")
+    return false
+end
+
+notify = function(title, content)
+    if not Config.Notifications or not Window or Window.unloaded then
+        return
+    end
+    pcall(function()
+        Window:Notify({
+            title = title,
+            content = content,
+            duration = 4,
+        })
+    end)
+end
+
+local function dropdownValue(value)
+    if type(value) == "table" then
+        return value[1]
+    end
+    return value
+end
+
+local function refreshPlayerDropdown()
+    local control = Controls.PlayerSelect
+    if not control then
+        return
+    end
+
+    local options = playerNameOptions()
+    pcall(function()
+        if type(control.Refresh) == "function" then
+            control:Refresh(options)
+        end
+    end)
+
+    if SelectedPlayerName and not table.find(options, SelectedPlayerName) then
+        SelectedPlayerName = nil
+        if SpectatingPlayer then
+            stopSpectating()
+        end
+    end
+end
+
+local function applyPreset(number)
+    local preset = aimPresets[number]
+    if not preset then
+        return
+    end
+
+    activePreset = number
+    Config.AimRadius = preset.AimRadius
+    Config.AimStrength = preset.AimStrength
+    Config.AimFollowSpeed = preset.AimFollowSpeed or Config.AimFollowSpeed
+    Config.AimTarget = preset.AimTarget
+    Config.AimLeadTime = preset.AimLeadTime
+    Config.AimTurnSpeed = preset.AimTurnSpeed
+    LockedCharacter = nil
+
+    safeSet(Controls.AimRadius, Config.AimRadius)
+    safeSet(Controls.AimStrength, math.floor(Config.AimStrength * 100 + 0.5))
+    safeSet(Controls.AimFollowSpeed, Config.AimFollowSpeed)
+    safeSet(Controls.AimTarget, Config.AimTarget)
+    safeSet(Controls.AimLeadTime, math.floor(Config.AimLeadTime * 1000 + 0.5))
+    safeSet(Controls.AimTurnSpeed, Config.AimTurnSpeed)
+end
+
+if Window then
+    local uiBuildOk, uiBuildError = xpcall(function()
+        local ESPTab = Window:CreateTab({name = "ESP"})
+        local AimTab = Window:CreateTab({name = "Aim"})
+        local PlayersTab = Window:CreateTab({name = "Players"})
+        local MovementTab = Window:CreateTab({name = "Movement"})
+        local VisualsTab = Window:CreateTab({name = "Visuals"})
+        local SettingsTab = Window:CreateTab({name = "Settings"})
+
+        ESPTab:CreateSection({name = "Player ESP"})
+
+        ESPTab:CreateToggle({
+            name = "Players",
+            value = Config.Players,
+            flag = "ESPPlayers",
+            callback = function(value)
+                Config.Players = value
+            end,
+        })
+
+        ESPTab:CreateToggle({
+            name = "Boxes",
+            value = Config.Boxes,
+            flag = "ESPBoxes",
+            callback = function(value)
+                Config.Boxes = value
+            end,
+        })
+
+        ESPTab:CreateToggle({
+            name = "Health Bar",
+            value = Config.Health,
+            flag = "ESPHealth",
+            callback = function(value)
+                Config.Health = value
+            end,
+        })
+
+        ESPTab:CreateToggle({
+            name = "Chams",
+            value = Config.Chams,
+            flag = "ESPChams",
+            callback = function(value)
+                Config.Chams = value
+            end,
+        })
+
+        ESPTab:CreateToggle({
+            name = "Skeleton",
+            value = Config.Skeleton,
+            flag = "ESPSkeleton",
+            callback = function(value)
+                Config.Skeleton = value
+            end,
+        })
+
+        ESPTab:CreateToggle({
+            name = "Names",
+            value = Config.Names,
+            flag = "ESPNames",
+            callback = function(value)
+                Config.Names = value
+            end,
+        })
+
+        ESPTab:CreateDropdown({
+            name = "Name Type",
+            options = {"Username", "Display Name"},
+            value = Config.DisplayName and "Display Name" or "Username",
+            multiSelect = false,
+            flag = "ESPNameType",
+            callback = function(value)
+                Config.DisplayName = value == "Display Name"
+            end,
+        })
+
+        ESPTab:CreateToggle({
+            name = "Threat Arrows",
+            value = Config.ThreatArrows,
+            flag = "ESPThreatArrows",
+            callback = function(value)
+                Config.ThreatArrows = value
+            end,
+        })
+
+        ESPTab:CreateToggle({
+            name = "Combat ESP Highlight",
+            value = Config.CombatESP,
+            flag = "ESPCombat",
+            callback = function(value)
+                Config.CombatESP = value
+            end,
+        })
+
+        ESPTab:CreateSlider({
+            name = "ESP Distance",
+            range = {25, 10000},
+            increment = 25,
+            suffix = " studs",
+            value = Config.ESPDistance,
+            flag = "ESPDistance",
+            callback = function(value)
+                Config.ESPDistance = value
+            end,
+        })
+
+        ESPTab:CreateSection({name = "Visual"})
+
+        ESPTab:CreateToggle({
+            name = "Fullbright",
+            value = Config.Fullbright,
+            flag = "ESPFullbright",
+            callback = setFullbright,
+        })
+
+        AimTab:CreateSection({name = "Aim Assist"})
+
+        AimTab:CreateToggle({
+            name = "Aim Assist (hold RMB)",
+            value = Config.AimAssist,
+            flag = "AimAssist",
+            callback = function(value)
+                Config.AimAssist = value
+                if not value then
+                    LockedCharacter = nil
+                    SelectedCharacter = nil
+                    TargetScanCharacter = nil
+                    TargetScanNextAt = 0
+                end
+            end,
+        })
+
+        Controls.AimMode = AimTab:CreateDropdown({
+            name = "Aim Mode",
+            description = "Standard follows immediately; Legit adds reaction and turn limits.",
+            options = {"Standard", "Legit"},
+            value = Config.AimMode,
+            multiSelect = false,
+            flag = "AimMode",
+            callback = function(value)
+                if value == "Standard" or value == "Legit" then
+                    setAimMode(value)
+                end
+            end,
+        })
+
+        Controls.LegitReactionTime = AimTab:CreateSlider({
+            name = "Legit Reaction Time",
+            description = "Delay before a newly acquired target is followed.",
+            range = {0, 300},
+            increment = 10,
+            suffix = " ms",
+            value = math.floor(Config.LegitReactionTime * 1000 + 0.5),
+            flag = "LegitReactionTime",
+            callback = function(value)
+                Config.LegitReactionTime = value / 1000
+            end,
+        })
+
+        AimTab:CreateToggle({
+            name = "Ignore Teammates",
+            value = Config.AimTeamCheck,
+            flag = "AimTeamCheck",
+            callback = function(value)
+                Config.AimTeamCheck = value
+            end,
+        })
+
+        Controls.AimFrontOnly = AimTab:CreateToggle({
+            name = "Front Targets Only",
+            description = "Only selects targets inside the camera's forward cone.",
+            value = Config.AimFrontOnly,
+            flag = "AimFrontOnly",
+            callback = function(value)
+                Config.AimFrontOnly = value
+                TargetScanCharacter = nil
+                TargetScanNextAt = 0
+            end,
+        })
+
+        Controls.AimFrontAngle = AimTab:CreateSlider({
+            name = "Front Cone Angle",
+            range = {10, 89},
+            increment = 1,
+            suffix = "°",
+            value = Config.AimFrontAngle,
+            flag = "AimFrontAngle",
+            callback = function(value)
+                Config.AimFrontAngle = value
+                TargetScanCharacter = nil
+                TargetScanNextAt = 0
+            end,
+        })
+
+        Controls.AimScanInterval = AimTab:CreateSlider({
+            name = "Target Scan Interval",
+            description = "How often the script searches for a new target.",
+            range = {100, 1000},
+            increment = 100,
+            suffix = " ms",
+            value = math.floor(Config.AimScanInterval * 1000 + 0.5),
+            flag = "AimScanInterval",
+            callback = function(value)
+                Config.AimScanInterval = value / 1000
+                TargetScanNextAt = 0
+            end,
+        })
+
+        Controls.AimLock = AimTab:CreateToggle({
+            name = "Target Lock",
+            value = Config.AimLock,
+            flag = "AimLock",
+            callback = function(value)
+                Config.AimLock = value
+                if not value then
+                    LockedCharacter = nil
+                end
+            end,
+        })
+
+        Controls.AimPrediction = AimTab:CreateToggle({
+            name = "Movement Lead",
+            value = Config.AimPrediction,
+            flag = "AimPrediction",
+            callback = function(value)
+                Config.AimPrediction = value
+            end,
+        })
+
+        Controls.SmoothAim = AimTab:CreateToggle({
+            name = "Smooth Aim",
+            value = Config.SmoothAim,
+            flag = "SmoothAim",
+            callback = function(value)
+                Config.SmoothAim = value
+            end,
+        })
+
+        Controls.CameraRecoilDamping = AimTab:CreateToggle({
+            name = "Camera Recoil Dampening",
+            value = Config.CameraRecoilDamping,
+            flag = "CameraRecoilDamping",
+            callback = function(value)
+                Config.CameraRecoilDamping = value
+            end,
+        })
+
+        AimTab:CreateToggle({
+            name = "Infinite Aim Range",
+            description = "Ignores the aim distance slider. ESP distance stays separate.",
+            value = Config.InfiniteAimRange,
+            flag = "InfiniteAimRange",
+            callback = function(value)
+                Config.InfiniteAimRange = value
+            end,
+        })
+
+        AimTab:CreateSlider({
+            name = "Aim Range",
+            range = {25, 10000},
+            increment = 25,
+            suffix = " studs",
+            value = Config.AimMaxDistance,
+            flag = "AimMaxDistance",
+            callback = function(value)
+                Config.AimMaxDistance = value
+            end,
+        })
+
+        Controls.AimRadius = AimTab:CreateSlider({
+            name = "Aim Radius",
+            range = {40, 400},
+            increment = 5,
+            suffix = " px",
+            value = Config.AimRadius,
+            flag = "AimRadius",
+            callback = function(value)
+                Config.AimRadius = value
+            end,
+        })
+
+        Controls.AimStrength = AimTab:CreateSlider({
+            name = "Aim Strength",
+            range = {1, 100},
+            increment = 1,
+            suffix = "%",
+            value = math.floor(Config.AimStrength * 100 + 0.5),
+            flag = "AimStrength",
+            callback = function(value)
+                Config.AimStrength = value / 100
+            end,
+        })
+
+        Controls.AimFollowSpeed = AimTab:CreateSlider({
+            name = "Aim Follow Speed",
+            description = "How quickly the camera moves toward the selected target.",
+            range = {10, 100},
+            increment = 5,
+            suffix = "%",
+            value = Config.AimFollowSpeed,
+            flag = "AimFollowSpeed",
+            callback = function(value)
+                Config.AimFollowSpeed = value
+            end,
+        })
+
+        Controls.AimLeadTime = AimTab:CreateSlider({
+            name = "Lead Time",
+            range = {0, 250},
+            increment = 5,
+            suffix = " ms",
+            value = math.floor(Config.AimLeadTime * 1000 + 0.5),
+            flag = "AimLeadTime",
+            callback = function(value)
+                Config.AimLeadTime = value / 1000
+            end,
+        })
+
+        Controls.AimTurnSpeed = AimTab:CreateSlider({
+            name = "Turn Speed",
+            range = {60, 720},
+            increment = 10,
+            suffix = "°/s",
+            value = Config.AimTurnSpeed,
+            flag = "AimTurnSpeed",
+            callback = function(value)
+                Config.AimTurnSpeed = value
+            end,
+        })
+
+        AimTab:CreateSlider({
+            name = "Recoil Dampening",
+            range = {0, 100},
+            increment = 1,
+            suffix = "%",
+            value = math.floor(Config.RecoilStrength * 100 + 0.5),
+            flag = "RecoilStrength",
+            callback = function(value)
+                Config.RecoilStrength = value / 100
+            end,
+        })
+
+        Controls.AimTarget = AimTab:CreateDropdown({
+            name = "Aim Target",
+            options = {"Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg", "Closest"},
+            value = Config.AimTarget,
+            multiSelect = false,
+            flag = "AimTarget",
+            callback = function(value)
+                if value then
+                    Config.AimTarget = value
+                    LockedCharacter = nil
+                end
+            end,
+        })
+
+        AimTab:CreateSection({name = "Weapon Presets"})
+
+        for index = 1, 3 do
+            local presetIndex = index
+            AimTab:CreateButton({
+                name = "Load Preset " .. presetIndex,
+                callback = function()
+                    applyPreset(presetIndex)
+                end,
+            })
+        end
+
+        AimTab:CreateButton({
+            name = "Save Current To Active Preset",
+            callback = function()
+                aimPresets[activePreset] = {
+                    AimRadius = Config.AimRadius,
+                    AimStrength = Config.AimStrength,
+                    AimFollowSpeed = Config.AimFollowSpeed,
+                    AimTarget = Config.AimTarget,
+                    AimLeadTime = Config.AimLeadTime,
+                    AimTurnSpeed = Config.AimTurnSpeed,
+                }
+
+                pcall(function()
+                    Window:Notify({
+                        title = "Preset saved",
+                        content = "Saved current aim settings to preset " .. activePreset,
+                    })
+                end)
+            end,
+        })
+
+        AimTab:CreateSection({name = "Recommended Settings"})
+
+        AimTab:CreateButton({
+            name = "Apply Standard Recommended",
+            description = "Balanced settings with full follow speed.",
+            callback = function()
+                applyStandardRecommended()
+                notify("Aim", "Standard recommended settings applied")
+            end,
+        })
+
+        AimTab:CreateButton({
+            name = "Apply Legit Recommended",
+            description = "Smooth, slower settings with reaction delay.",
+            callback = function()
+                applyLegitRecommended()
+                notify("Aim", "Legit recommended settings applied")
+            end,
+        })
+
+        AimTab:CreateSection({name = "Camera"})
+
+        Controls.FOV = AimTab:CreateSlider({
+            name = "Camera FOV",
+            range = {30, 120},
+            increment = 1,
+            suffix = "°",
+            value = FOV.Value,
+            flag = "CameraFOV",
+            callback = function(value)
+                setFov(value)
+            end,
+        })
+
+        AimTab:CreateButton({
+            name = "Reset Camera FOV",
+            callback = function()
+                resetFov()
+                safeSet(Controls.FOV, FOV.Value)
+            end,
+        })
+
+        PlayersTab:CreateSection({name = "Player Tools"})
+
+        local initialPlayerOptions = playerNameOptions()
+        Controls.PlayerSelect = PlayersTab:CreateDropdown({
+            name = "Select Player",
+            options = initialPlayerOptions,
+            value = initialPlayerOptions[1],
+            multiSelect = false,
+            forgetState = true,
+            callback = function(value)
+                local selected = dropdownValue(value)
+                if selected == "<no players>" then
+                    SelectedPlayerName = nil
+                else
+                    SelectedPlayerName = selected
+                end
+            end,
+        })
+
+        PlayersTab:CreateButton({
+            name = "Refresh Player List",
+            callback = function()
+                refreshPlayerDropdown()
+                notify("Players", "Player list refreshed")
+            end,
+        })
+
+        PlayersTab:CreateButton({
+            name = "Spectate Selected",
+            callback = function()
+                local player = getPlayerByName(SelectedPlayerName)
+                if spectatePlayer(player) then
+                    notify("Spectate", "Now spectating " .. player.Name)
+                else
+                    notify("Spectate", "Select a live player first")
+                end
+            end,
+        })
+
+        PlayersTab:CreateButton({
+            name = "Stop Spectating",
+            callback = function()
+                stopSpectating()
+                notify("Spectate", "Returned to your character")
+            end,
+        })
+
+        VisualsTab:CreateSection({name = "Crosshair"})
+
+        VisualsTab:CreateToggle({
+            name = "Crosshair",
+            value = Config.Crosshair,
+            flag = "CrosshairEnabled",
+            callback = function(value)
+                Config.Crosshair = value
+                refreshCrosshair()
+            end,
+        })
+
+        VisualsTab:CreateToggle({
+            name = "Dynamic Crosshair",
+            description = "Expands the visual crosshair slightly while firing.",
+            value = Config.CrosshairDynamic,
+            flag = "CrosshairDynamic",
+            callback = function(value)
+                Config.CrosshairDynamic = value
+            end,
+        })
+
+        VisualsTab:CreateSlider({
+            name = "Crosshair Size",
+            range = {2, 30},
+            increment = 1,
+            suffix = " px",
+            value = Config.CrosshairSize,
+            flag = "CrosshairSize",
+            callback = function(value)
+                Config.CrosshairSize = value
+                refreshCrosshair()
+            end,
+        })
+
+        VisualsTab:CreateSlider({
+            name = "Crosshair Gap",
+            range = {0, 20},
+            increment = 1,
+            suffix = " px",
+            value = Config.CrosshairGap,
+            flag = "CrosshairGap",
+            callback = function(value)
+                Config.CrosshairGap = value
+                refreshCrosshair()
+            end,
+        })
+
+        VisualsTab:CreateSlider({
+            name = "Crosshair Thickness",
+            range = {1, 6},
+            increment = 1,
+            suffix = " px",
+            value = Config.CrosshairThickness,
+            flag = "CrosshairThickness",
+            callback = function(value)
+                Config.CrosshairThickness = value
+                refreshCrosshair()
+            end,
+        })
+
+        VisualsTab:CreateDropdown({
+            name = "Crosshair Color",
+            options = {"Purple", "White", "Red", "Green", "Blue", "Yellow"},
+            value = Config.CrosshairColor,
+            multiSelect = false,
+            flag = "CrosshairColor",
+            callback = function(value)
+                local selected = dropdownValue(value)
+                if CROSSHAIR_COLORS[selected] then
+                    Config.CrosshairColor = selected
+                    refreshCrosshair()
+                end
+            end,
+        })
+
+        VisualsTab:CreateSection({name = "Aim FOV Circle"})
+
+        VisualsTab:CreateToggle({
+            name = "Show Aim FOV Circle",
+            value = Config.AimCircleVisible,
+            flag = "AimCircleVisible",
+            callback = function(value)
+                Config.AimCircleVisible = value
+            end,
+        })
+
+        VisualsTab:CreateSlider({
+            name = "FOV Circle Thickness",
+            range = {1, 6},
+            increment = 1,
+            suffix = " px",
+            value = Config.AimCircleThickness,
+            flag = "AimCircleThickness",
+            callback = function(value)
+                Config.AimCircleThickness = value
+                refreshAimCircleStyle()
+            end,
+        })
+
+        VisualsTab:CreateDropdown({
+            name = "FOV Circle Color",
+            options = {"Purple", "White", "Red", "Green", "Blue", "Yellow"},
+            value = Config.AimCircleColor,
+            multiSelect = false,
+            flag = "AimCircleColor",
+            callback = function(value)
+                local selected = dropdownValue(value)
+                if CROSSHAIR_COLORS[selected] then
+                    Config.AimCircleColor = selected
+                    refreshAimCircleStyle()
+                end
+            end,
+        })
+
+        VisualsTab:CreateSection({name = "Diagnostics"})
+
+        VisualsTab:CreateToggle({
+            name = "Performance HUD",
+            value = Config.PerformanceHUD,
+            flag = "PerformanceHUD",
+            callback = function(value)
+                Config.PerformanceHUD = value
+                if PerformanceGui then
+                    PerformanceGui.Enabled = value and not PanicActive
+                end
+            end,
+        })
+
+        MovementTab:CreateSection({name = "Movement"})
+
+        MovementTab:CreateToggle({
+            name = "Custom Walk Speed",
+            value = Config.WalkSpeedEnabled,
+            flag = "WalkSpeedEnabled",
+            callback = function(value)
+                Config.WalkSpeedEnabled = value
+            end,
+        })
+
+        MovementTab:CreateSlider({
+            name = "Walk Speed",
+            range = {8, 60},
+            increment = 1,
+            value = Config.WalkSpeed,
+            flag = "WalkSpeed",
+            callback = function(value)
+                Config.WalkSpeed = value
+            end,
+        })
+
+        MovementTab:CreateToggle({
+            name = "Fly",
+            description = "WASD move • Space up • Q down",
+            value = Config.Fly,
+            flag = "Fly",
+            callback = function(value)
+                Config.Fly = value
+                if not value and FlyHumanoid and FlyHumanoid.Parent then
+                    FlyHumanoid.PlatformStand = false
+                    FlyHumanoid = nil
+                end
+            end,
+        })
+
+        MovementTab:CreateToggle({
+            name = "Noclip",
+            description = "Disables character collisions while enabled; restores them when disabled.",
+            value = Config.Noclip,
+            flag = "Noclip",
+            callback = function(value)
+                Config.Noclip = value
+                if not value then
+                    restoreNoclip()
+                end
+            end,
+        })
+
+        MovementTab:CreateSlider({
+            name = "Fly Speed",
+            range = {10, 80},
+            increment = 1,
+            value = Config.FlySpeed,
+            flag = "FlySpeed",
+            callback = function(value)
+                Config.FlySpeed = value
+            end,
+        })
+
+        SettingsTab:CreateSection({name = "Profiles"})
+
+        SettingsTab:CreateButton({
+            name = "Save Config Now",
+            description = "Saves the Default profile and keeps a session backup as a fallback.",
+            callback = function()
+                saveConfigNow()
+            end,
+        })
+
+        SettingsTab:CreateButton({
+            name = "Load Config Now",
+            description = "Loads the Default profile or restores the last session backup.",
+            callback = function()
+                loadConfigNow()
+            end,
+        })
+
+        SettingsTab:CreateSection({name = "Interface"})
+
+        SettingsTab:CreateToggle({
+            name = "Custom Cursor",
+            value = Config.Cursor,
+            flag = "CustomCursor",
+            callback = function(value)
+                Config.Cursor = value
+                setCursor(UiVisible and value)
+            end,
+        })
+
+        SettingsTab:CreateToggle({
+            name = "Notifications",
+            value = Config.Notifications,
+            flag = "Notifications",
+            callback = function(value)
+                Config.Notifications = value
+            end,
+        })
+
+        SettingsTab:CreateButton({
+            name = "Panic Toggle (END)",
+            description = "Instantly hides overlays and pauses local visual/movement features. Press END again to restore them.",
+            callback = function()
+                if Runtime.ESPBuild14TogglePanic then
+                    Runtime.ESPBuild14TogglePanic()
+                end
+            end,
+        })
+
+        SettingsTab:CreateButton({
+            name = "Hide / Show UI (Right Shift)",
+            callback = function()
+                UiVisible = not UiVisible
+                Window:ToggleHide()
+                setCursor(UiVisible and Config.Cursor)
+            end,
+        })
+
+        SettingsTab:CreateButton({
+            name = "Unload",
+            callback = function()
+                if unload then
+                    unload()
+                end
+            end,
+        })
+
+        connect(UserInputService.InputBegan, function(input)
+            if input.KeyCode ~= Enum.KeyCode.RightShift then
+                return
+            end
+            if UserInputService:GetFocusedTextBox() then
+                return
+            end
+            if not Window or Window.unloaded then
+                return
+            end
+
+            UiVisible = not UiVisible
+            pcall(function()
+                Window:ToggleHide()
+            end)
+            setCursor(UiVisible and Config.Cursor)
+        end)
+
+        connect(Players.PlayerAdded, function()
+            task.defer(refreshPlayerDropdown)
+        end)
+
+        connect(Players.PlayerRemoving, function(player)
+            if SpectatingPlayer == player then
+                stopSpectating()
+            end
+            task.defer(refreshPlayerDropdown)
+        end)
+
+        task.defer(refreshPlayerDropdown)
+        pcall(function()
+            Window:Navigate("ESP")
+        end)
+        notify("Build 14", RayfieldConfigEnabled
+            and "UI loaded • config enabled • END = panic toggle"
+            or "UI loaded • config unavailable • END = panic toggle")
+    end, function(err)
+        local message = tostring(err)
+        if debug and type(debug.traceback) == "function" then
+            local okTrace, trace = pcall(debug.traceback, message, 2)
+            if okTrace and trace then
+                message = trace
+            end
+        end
+        return message
+    end)
+
+    if not uiBuildOk then
+        warn("[Build14] Rayfield control build failed: " .. tostring(uiBuildError))
+        pcall(function()
+            Window:Notify({
+                title = "Build 14 UI error",
+                content = "A Rayfield control failed to build. Check the executor console for the exact line.",
+                duration = 9,
+            })
+        end)
+    end
+end
+
+------------------------------------------------------------
+-- Panic toggle
+------------------------------------------------------------
+
+local PanicSnapshot = nil
+local PanicUiWasVisible = true
+
+local function setPanic(active)
+    if PanicActive == active then
+        return
+    end
+
+    PanicActive = active
+
+    if active then
+        PanicSnapshot = {
+            Players = Config.Players,
+            AimAssist = Config.AimAssist,
+            Fullbright = Config.Fullbright,
+            Cursor = Config.Cursor,
+            Fly = Config.Fly,
+            Noclip = Config.Noclip,
+            WalkSpeedEnabled = Config.WalkSpeedEnabled,
+            Crosshair = Config.Crosshair,
+            PerformanceHUD = Config.PerformanceHUD,
+        }
+
+        Config.Players = false
+        Config.AimAssist = false
+        Config.Fly = false
+        Config.Noclip = false
+        Config.WalkSpeedEnabled = false
+        LockedCharacter = nil
+        SelectedCharacter = nil
+
+        setFullbright(false)
+        setCursor(false)
+        restoreMovement()
+        restoreNoclip()
+        stopSpectating()
+
+        if ScreenGui then ScreenGui.Enabled = false end
+        if AimGui then AimGui.Enabled = false end
+        if CrosshairGui then CrosshairGui.Enabled = false end
+        if PerformanceGui then PerformanceGui.Enabled = false end
+
+        PanicUiWasVisible = UiVisible
+        if Window and UiVisible then
+            pcall(function() Window:ToggleHide() end)
+            UiVisible = false
+        end
+    else
+        local snapshot = PanicSnapshot or {}
+        Config.Players = snapshot.Players ~= false
+        Config.AimAssist = snapshot.AimAssist == true
+        Config.Cursor = snapshot.Cursor == true
+        Config.Fly = snapshot.Fly == true
+        Config.Noclip = snapshot.Noclip == true
+        Config.WalkSpeedEnabled = snapshot.WalkSpeedEnabled == true
+        Config.Crosshair = snapshot.Crosshair == true
+        Config.PerformanceHUD = snapshot.PerformanceHUD ~= false
+
+        if snapshot.Fullbright then
+            setFullbright(true)
+        end
+
+        if ScreenGui then ScreenGui.Enabled = true end
+        if AimGui then AimGui.Enabled = true end
+        if CrosshairGui then CrosshairGui.Enabled = Config.Crosshair end
+        if PerformanceGui then PerformanceGui.Enabled = Config.PerformanceHUD end
+        setCursor(UiVisible and Config.Cursor)
+        refreshCrosshair()
+
+        if Window and PanicUiWasVisible and not UiVisible then
+            pcall(function() Window:ToggleHide() end)
+            UiVisible = true
+            setCursor(Config.Cursor)
+        end
+
+        PanicSnapshot = nil
+    end
+end
+
+Runtime.ESPBuild14TogglePanic = function()
+    setPanic(not PanicActive)
+    notify("Panic", PanicActive and "Overlays paused — press END to restore" or "Settings restored")
+end
+
+connect(UserInputService.InputBegan, function(input, processed)
+    if processed or UserInputService:GetFocusedTextBox() then
+        return
+    end
+    if input.KeyCode == Enum.KeyCode.End then
+        Runtime.ESPBuild14TogglePanic()
+    end
+end)
+
+------------------------------------------------------------
+-- Cleanup
+------------------------------------------------------------
+
+unload = function()
+    if Unloaded then
+        return
+    end
+    Unloaded = true
+
+    Runtime.ESPInterfaceUnload = nil
+    Runtime.ESPBuild14TogglePanic = nil
+
+    Config.AimAssist = false
+    Config.Fly = false
+    Config.Noclip = false
+    Config.WalkSpeedEnabled = false
+    LockedCharacter = nil
+    SelectedCharacter = nil
+
+    pcall(function()
+        RunService:UnbindFromRenderStep(ESP_BIND_NAME)
+    end)
+    pcall(function()
+        RunService:UnbindFromRenderStep(AIM_BIND_NAME)
+    end)
+    pcall(function()
+        RunService:UnbindFromRenderStep(RECOIL_CAPTURE_BIND_NAME)
+    end)
+    pcall(function()
+        RunService:UnbindFromRenderStep(FOV_BIND_NAME)
+    end)
+    pcall(function()
+        RunService:UnbindFromRenderStep(CURSOR_BIND_NAME)
+    end)
+    pcall(function()
+        RunService:UnbindFromRenderStep(MOVEMENT_BIND_NAME)
+    end)
+    pcall(function()
+        RunService:UnbindFromRenderStep(CROSSHAIR_BIND_NAME)
+    end)
+
+    resetFov()
+    setFullbright(false)
+    setCursor(false)
+    restoreMovement()
+    restoreNoclip()
+    stopSpectating()
+
+    if FOV.CameraConnection then
+        pcall(function()
+            FOV.CameraConnection:Disconnect()
+        end)
+        FOV.CameraConnection = nil
+    end
+
+    for _, connection in ipairs(Connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+    table.clear(Connections)
+
+    local characters = {}
+    for character in pairs(Tracked) do
+        table.insert(characters, character)
+    end
+    for _, character in ipairs(characters) do
+        removeEntry(character)
+    end
+
+    if AimGui then
+        pcall(function()
+            AimGui:Destroy()
+        end)
+    end
+
+    if ScreenGui then
+        pcall(function()
+            ScreenGui:Destroy()
+        end)
+    end
+
+    if Cursor.Gui then
+        pcall(function()
+            Cursor.Gui:Destroy()
+        end)
+        Cursor.Gui = nil
+    end
+
+    if CrosshairGui then
+        pcall(function() CrosshairGui:Destroy() end)
+    end
+    if PerformanceGui then
+        pcall(function() PerformanceGui:Destroy() end)
+    end
+    if RayfieldFallbackGui then
+        pcall(function() RayfieldFallbackGui:Destroy() end)
+        RayfieldFallbackGui = nil
+    end
+
+    if Window and not Window.unloaded then
+        pcall(function()
+            Window:Unload()
+        end)
+    end
+
+    UserInputService.MouseIconEnabled = Cursor.OriginalIcon ~= false
+end
+
+Runtime.ESPInterfaceUnload = unload
+
+-- If Rayfield failed to load, keep the functionality alive and make the error obvious.
+if not Rayfield then
+    warn("ESP build 14 loaded without Rayfield Gen2 UI: " .. tostring(RayfieldBootError or "unknown loader error"))
+end
