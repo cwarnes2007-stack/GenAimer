@@ -1,7 +1,6 @@
--- ESP / Aim interface - Rayfield Gen2 build 14
--- Startup-hardened build based on build 13.
--- Rayfield is bootstrapped before the ESP/cursor/HUD/movement systems so a later
--- feature error cannot prevent the interface itself from appearing.
+-- GenAimer - Rayfield interface with ESP, aim assistance, diagnostics, and cleanup.
+-- Rayfield startup is isolated so a feature error cannot prevent the interface
+-- from reporting what failed.
 -- Configuration saving is enabled only when the executor exposes the required
 -- filesystem functions; otherwise the UI falls back to in-memory settings.
 
@@ -38,6 +37,7 @@ local Config = {
     CombatESP = true,
 
     ESPDistance = 1000,
+    ESPUpdateInterval = 0.001,
 
     AimAssist = false,
     AimMode = "Standard",
@@ -102,13 +102,13 @@ local TargetScanCharacter = nil
 local TargetScanNextAt = 0
 local Unloaded = false
 
-local ESP_BIND_NAME = "ESP_Build11_Update"
-local AIM_BIND_NAME = "ESP_Build11_AimAssist"
-local RECOIL_CAPTURE_BIND_NAME = "ESP_Build11_RecoilCapture"
-local FOV_BIND_NAME = "ESP_Build11_FOV"
-local CURSOR_BIND_NAME = "ESP_Build11_Cursor"
-local MOVEMENT_BIND_NAME = "ESP_Build11_Movement"
-local CROSSHAIR_BIND_NAME = "ESP_Build14_Crosshair"
+local ESP_BIND_NAME = "GenAimer_ESP_Update"
+local AIM_BIND_NAME = "GenAimer_AimAssist"
+local RECOIL_CAPTURE_BIND_NAME = "GenAimer_RecoilCapture"
+local FOV_BIND_NAME = "GenAimer_FOV"
+local CURSOR_BIND_NAME = "GenAimer_Cursor"
+local MOVEMENT_BIND_NAME = "GenAimer_Movement"
+local CROSSHAIR_BIND_NAME = "GenAimer_Crosshair"
 
 
 ------------------------------------------------------------
@@ -165,17 +165,17 @@ local function loadRayfieldGen2()
     end
 
     local stableError = tostring(result)
-    warn("[Build14] Stable Rayfield Gen2 load failed: " .. stableError)
+    warn("[GenAimer] Stable Rayfield Gen2 load failed: " .. stableError)
 
     -- Preview is only a loader fallback. Stable remains the preferred build.
     local previewOk, previewResult = tryLoadRayfield("https://sirius.menu/gen2-preview")
     if previewOk and previewResult then
-        warn("[Build14] Using Rayfield Gen2 preview because stable failed")
+        warn("[GenAimer] Using Rayfield Gen2 preview because stable failed")
         return previewResult
     end
 
     RayfieldBootError = "stable: " .. stableError .. " | preview: " .. tostring(previewResult)
-    warn("[Build14] Rayfield Gen2 unavailable: " .. RayfieldBootError)
+    warn("[GenAimer] Rayfield Gen2 unavailable: " .. RayfieldBootError)
     return nil
 end
 
@@ -185,8 +185,8 @@ local function createRayfieldWindow(library)
     end
 
     local props = {
-        name = "ESP • build 14",
-        subtitle = "Startup Hardened",
+        name = "GenAimer",
+        subtitle = "Aim + ESP",
         sidebarLayout = true,
         theme = "amethyst",
         showName = "ESP",
@@ -197,7 +197,7 @@ local function createRayfieldWindow(library)
             autoSave = true,
             autoLoad = true,
             fileName = "Default",
-            customFolder = "ESPBuild14",
+            customFolder = "GenAimer",
         }
         RayfieldConfigEnabled = true
     end
@@ -218,12 +218,12 @@ local function createRayfieldWindow(library)
         end)
 
         if retryOk and retryResult then
-            warn("[Build14] Rayfield config disabled after startup error: " .. firstError)
+            warn("[GenAimer] Rayfield config disabled after startup error: " .. firstError)
             return retryResult
         end
 
         RayfieldBootError = "CreateWindow failed: " .. firstError .. " | fallback: " .. tostring(retryResult)
-        warn("[Build14] " .. RayfieldBootError)
+        warn("[GenAimer] " .. RayfieldBootError)
         return nil
     end
 
@@ -233,21 +233,14 @@ end
 Rayfield = loadRayfieldGen2()
 Window = createRayfieldWindow(Rayfield)
 
--- Create one tab immediately. If something later in the script fails, the user
--- can still see that Rayfield itself loaded instead of getting a blank failure.
 local RayfieldFallbackGui = nil
 
-if Window then
-    pcall(function()
-        local statusTab = Window:CreateTab({name = "Status"})
-        statusTab:CreateSection({name = "Rayfield loaded — initialising features..."})
-    end)
-else
+if not Window then
     -- If Rayfield cannot start, show the actual bootstrap error on-screen so the
     -- failure is not mistaken for the script doing nothing.
     pcall(function()
         RayfieldFallbackGui = Instance.new("ScreenGui")
-        RayfieldFallbackGui.Name = "ESP_Build14_RayfieldError"
+        RayfieldFallbackGui.Name = "GenAimer_RayfieldError"
         RayfieldFallbackGui.ResetOnSpawn = false
         RayfieldFallbackGui.DisplayOrder = 100000
         RayfieldFallbackGui.Parent = PlayerGui
@@ -273,7 +266,7 @@ else
         title.Position = UDim2.fromOffset(14, 10)
         title.Size = UDim2.new(1, -28, 0, 24)
         title.BackgroundTransparency = 1
-        title.Text = "Build 14 — Rayfield failed to start"
+        title.Text = "GenAimer - Rayfield failed to start"
         title.TextColor3 = Color3.fromRGB(255, 220, 225)
         title.Font = Enum.Font.GothamBold
         title.TextSize = 16
@@ -318,9 +311,26 @@ local function getRoot(character)
     if not character then
         return nil
     end
-    return character:FindFirstChild("HumanoidRootPart")
-        or character.PrimaryPart
-        or character:FindFirstChildWhichIsA("BasePart")
+
+    for _, name in ipairs({
+        "HumanoidRootPart",
+        "RootPart",
+        "Root",
+        "UpperTorso",
+        "Torso",
+        "UpperBody",
+    }) do
+        local part = character:FindFirstChild(name)
+        if part and part:IsA("BasePart") then
+            return part
+        end
+    end
+
+    if character.PrimaryPart and character.PrimaryPart:IsA("BasePart") then
+        return character.PrimaryPart
+    end
+
+    return character:FindFirstChildWhichIsA("BasePart")
 end
 
 local function getHumanoid(character)
@@ -510,7 +520,7 @@ end
 ------------------------------------------------------------
 
 local ScreenGui = create("ScreenGui", {
-    Name = "ESP_Build11_Drawings",
+    Name = "GenAimer_Drawings",
     ResetOnSpawn = false,
     DisplayOrder = 998,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
@@ -541,6 +551,73 @@ local SKELETON_R6 = {
     {"Torso", "Right Leg"},
 }
 
+local MAX_SKELETON_LINES = 24
+
+local function hasNamedParts(character, names)
+    for _, name in ipairs(names) do
+        local part = character:FindFirstChild(name)
+        if not part or not part:IsA("BasePart") then
+            return false
+        end
+    end
+    return true
+end
+
+local function dynamicSkeletonSegments(character)
+    local segments = {}
+    local seen = {}
+
+    for _, joint in ipairs(character:GetDescendants()) do
+        local first = nil
+        local second = nil
+        if joint:IsA("JointInstance") or joint:IsA("WeldConstraint") then
+            first = joint.Part0
+            second = joint.Part1
+        end
+
+        if first and second and first:IsA("BasePart") and second:IsA("BasePart") then
+            seen[first] = seen[first] or {}
+            if not seen[first][second] then
+                seen[first][second] = true
+                table.insert(segments, {first, second})
+            end
+        end
+    end
+
+    return segments
+end
+
+local function skeletonSegmentsFor(character)
+    local humanoid = getHumanoid(character)
+    local r15Parts = {
+        "Head", "UpperTorso", "LowerTorso", "LeftUpperArm", "LeftLowerArm",
+        "LeftHand", "RightUpperArm", "RightLowerArm", "RightHand",
+        "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "RightUpperLeg",
+        "RightLowerLeg", "RightFoot",
+    }
+    local r6Parts = {"Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg"}
+
+    if humanoid and humanoid.RigType == Enum.HumanoidRigType.R15 and hasNamedParts(character, r15Parts) then
+        return SKELETON_R15
+    end
+    if humanoid and humanoid.RigType == Enum.HumanoidRigType.R6 and hasNamedParts(character, r6Parts) then
+        return SKELETON_R6
+    end
+    if hasNamedParts(character, r15Parts) then
+        return SKELETON_R15
+    end
+    if hasNamedParts(character, r6Parts) then
+        return SKELETON_R6
+    end
+
+    local dynamic = dynamicSkeletonSegments(character)
+    if #dynamic > 0 then
+        return dynamic
+    end
+
+    return {}
+end
+
 local function hideSkeleton(entry)
     for _, line in ipairs(entry.SkeletonLines) do
         line.Visible = false
@@ -549,20 +626,28 @@ end
 
 local function updateSkeleton(entry, camera)
     local character = entry.Character
-    local segments = character:FindFirstChild("UpperTorso") and SKELETON_R15 or SKELETON_R6
+    local now = os.clock()
+    if now >= (entry.SkeletonRefreshAt or 0) then
+        entry.SkeletonSegments = skeletonSegmentsFor(character)
+        entry.SkeletonRefreshAt = now + 1
+    end
+
+    local segments = entry.SkeletonSegments or {}
     local projected = {}
 
-    local function positionOf(partName)
-        if projected[partName] == nil then
-            local part = character:FindFirstChild(partName)
+    local function positionOf(partReference)
+        if projected[partReference] == nil then
+            local part = typeof(partReference) == "Instance"
+                and partReference
+                or character:FindFirstChild(partReference)
             if part and part:IsA("BasePart") then
                 local point, onScreen = camera:WorldToScreenPoint(part.Position)
-                projected[partName] = onScreen and point.Z > 0 and Vector2.new(point.X, point.Y) or false
+                projected[partReference] = onScreen and point.Z > 0 and Vector2.new(point.X, point.Y) or false
             else
-                projected[partName] = false
+                projected[partReference] = false
             end
         end
-        return projected[partName]
+        return projected[partReference]
     end
 
     for index, line in ipairs(entry.SkeletonLines) do
@@ -665,7 +750,7 @@ local function createEntry(player, character)
     end
 
     local skeletonLines = {}
-    for _ = 1, #SKELETON_R15 do
+    for _ = 1, MAX_SKELETON_LINES do
         local line = create("Frame", {
             AnchorPoint = Vector2.new(0.5, 0.5),
             BackgroundColor3 = COLORS.ESP,
@@ -679,7 +764,7 @@ local function createEntry(player, character)
         AnchorPoint = Vector2.new(0.5, 0.5),
         Size = UDim2.fromOffset(28, 28),
         BackgroundTransparency = 1,
-        Text = "▲",
+        Text = "^",
         TextColor3 = COLORS.Accent,
         TextStrokeTransparency = 0.25,
         Font = Enum.Font.GothamBold,
@@ -688,7 +773,7 @@ local function createEntry(player, character)
     }, ScreenGui)
 
     local highlight = create("Highlight", {
-        Name = "ESP_Build11_Highlight",
+        Name = "GenAimer_Highlight",
         Adornee = character,
         FillColor = COLORS.ESP,
         OutlineColor = COLORS.ESP,
@@ -699,7 +784,7 @@ local function createEntry(player, character)
     }, ScreenGui)
 
     local billboard = create("BillboardGui", {
-        Name = "ESP_Build11_Billboard",
+        Name = "GenAimer_Billboard",
         Adornee = root,
         Size = UDim2.fromScale(4, 6),
         StudsOffset = Vector3.new(0, 0.8, 0),
@@ -760,6 +845,8 @@ local function createEntry(player, character)
         Player = player,
         Character = character,
         Root = root,
+        SkeletonSegments = skeletonSegmentsFor(character),
+        SkeletonRefreshAt = os.clock() + 1,
         Highlight = highlight,
         Billboard = billboard,
         Box = box,
@@ -833,7 +920,8 @@ end)
 local espElapsed = 0
 RunService:BindToRenderStep(ESP_BIND_NAME, Enum.RenderPriority.Last.Value - 2, function(dt)
     espElapsed += dt
-    if espElapsed < 1 / 20 then
+    local updateInterval = math.max(Config.ESPUpdateInterval or 0.001, 0.001)
+    if espElapsed < updateInterval then
         return
     end
     espElapsed = 0
@@ -953,7 +1041,7 @@ local AimCircleStroke = create("UIStroke", {
 ------------------------------------------------------------
 
 local CrosshairGui = create("ScreenGui", {
-    Name = "ESP_Build14_Crosshair",
+    Name = "GenAimer_Crosshair",
     ResetOnSpawn = false,
     IgnoreGuiInset = true,
     DisplayOrder = 9998,
@@ -1045,7 +1133,7 @@ RunService:BindToRenderStep(CROSSHAIR_BIND_NAME, Enum.RenderPriority.Last.Value 
 ------------------------------------------------------------
 
 local PerformanceGui = create("ScreenGui", {
-    Name = "ESP_Build14_Performance",
+    Name = "GenAimer_Performance",
     ResetOnSpawn = false,
     IgnoreGuiInset = true,
     DisplayOrder = 9997,
@@ -1100,7 +1188,7 @@ local PerformanceTitle = create("TextLabel", {
     Position = UDim2.fromOffset(14, 11),
     Size = UDim2.fromOffset(145, 20),
     BackgroundTransparency = 1,
-    Text = "BUILD 14",
+    Text = "GENAIMER",
     TextColor3 = Color3.fromRGB(247, 244, 252),
     Font = Enum.Font.GothamBold,
     TextSize = 14,
@@ -1220,7 +1308,7 @@ local function makeHudLabel(text, y, bold)
     }, card)
 end
 
-local PerfTitle = makeHudLabel("BUILD 14 • LIVE", 7, true)
+local PerfTitle = makeHudLabel("GENAIMER - LIVE", 7, true)
 local PerfFps = makeHudLabel("FPS: --", 28, false)
 local PerfPing = makeHudLabel("PING: --", 45, false)
 local PerfMemory = makeHudLabel("MEM: --", 62, false)
@@ -2147,7 +2235,7 @@ RunService:BindToRenderStep(MOVEMENT_BIND_NAME, Enum.RenderPriority.Character.Va
 end)
 
 ------------------------------------------------------------
--- Rayfield Gen2 UI • build 14 controls
+-- Rayfield Gen2 UI controls
 ------------------------------------------------------------
 
 local aimPresets = {
@@ -2535,6 +2623,19 @@ if Window then
             end,
         })
 
+        ESPTab:CreateSlider({
+            name = "ESP Scan Interval",
+            description = "Render-limited; 1 ms means update every available frame.",
+            range = {1, 1000},
+            increment = 1,
+            suffix = " ms",
+            value = math.floor(Config.ESPUpdateInterval * 1000 + 0.5),
+            flag = "ESPUpdateInterval",
+            callback = function(value)
+                Config.ESPUpdateInterval = value / 1000
+            end,
+        })
+
         ESPTab:CreateSection({name = "Visual"})
 
         ESPTab:CreateToggle({
@@ -2655,7 +2756,7 @@ if Window then
             name = "Front Cone Angle",
             range = {10, 89},
             increment = 1,
-            suffix = "°",
+            suffix = " deg",
             value = Config.AimFrontAngle,
             flag = "AimFrontAngle",
             callback = function(value)
@@ -2793,7 +2894,7 @@ if Window then
             name = "Turn Speed",
             range = {60, 720},
             increment = 10,
-            suffix = "°/s",
+            suffix = " deg/s",
             value = Config.AimTurnSpeed,
             flag = "AimTurnSpeed",
             callback = function(value)
@@ -2886,7 +2987,7 @@ if Window then
             name = "Camera FOV",
             range = {30, 120},
             increment = 1,
-            suffix = "°",
+            suffix = " deg",
             value = FOV.Value,
             flag = "CameraFOV",
             callback = function(value)
@@ -3102,7 +3203,7 @@ if Window then
 
         MovementTab:CreateToggle({
             name = "Fly",
-            description = "WASD move • Space up • Q down",
+            description = "WASD move - Space up - Q down",
             value = Config.Fly,
             flag = "Fly",
             callback = function(value)
@@ -3181,8 +3282,8 @@ if Window then
             name = "Panic Toggle (END)",
             description = "Instantly hides overlays and pauses local visual/movement features. Press END again to restore them.",
             callback = function()
-                if Runtime.ESPBuild14TogglePanic then
-                    Runtime.ESPBuild14TogglePanic()
+                if Runtime.GenAimerTogglePanic then
+                    Runtime.GenAimerTogglePanic()
                 end
             end,
         })
@@ -3238,9 +3339,9 @@ if Window then
         pcall(function()
             Window:Navigate("ESP")
         end)
-        notify("Build 14", RayfieldConfigEnabled
-            and "UI loaded • config enabled • END = panic toggle"
-            or "UI loaded • config unavailable • END = panic toggle")
+        notify("GenAimer", RayfieldConfigEnabled
+            and "UI loaded - config enabled - END = panic toggle"
+            or "UI loaded - config unavailable - END = panic toggle")
     end, function(err)
         local message = tostring(err)
         if debug and type(debug.traceback) == "function" then
@@ -3253,10 +3354,10 @@ if Window then
     end)
 
     if not uiBuildOk then
-        warn("[Build14] Rayfield control build failed: " .. tostring(uiBuildError))
+        warn("[GenAimer] Rayfield control build failed: " .. tostring(uiBuildError))
         pcall(function()
             Window:Notify({
-                title = "Build 14 UI error",
+                title = "GenAimer UI error",
                 content = "A Rayfield control failed to build. Check the executor console for the exact line.",
                 duration = 9,
             })
@@ -3350,9 +3451,9 @@ local function setPanic(active)
     end
 end
 
-Runtime.ESPBuild14TogglePanic = function()
+Runtime.GenAimerTogglePanic = function()
     setPanic(not PanicActive)
-    notify("Panic", PanicActive and "Overlays paused — press END to restore" or "Settings restored")
+    notify("Panic", PanicActive and "Overlays paused - press END to restore" or "Settings restored")
 end
 
 connect(UserInputService.InputBegan, function(input, processed)
@@ -3360,7 +3461,7 @@ connect(UserInputService.InputBegan, function(input, processed)
         return
     end
     if input.KeyCode == Enum.KeyCode.End then
-        Runtime.ESPBuild14TogglePanic()
+        Runtime.GenAimerTogglePanic()
     end
 end)
 
@@ -3375,7 +3476,7 @@ unload = function()
     Unloaded = true
 
     Runtime.ESPInterfaceUnload = nil
-    Runtime.ESPBuild14TogglePanic = nil
+    Runtime.GenAimerTogglePanic = nil
 
     Config.AimAssist = false
     Config.Fly = false
@@ -3481,5 +3582,5 @@ Runtime.ESPInterfaceUnload = unload
 
 -- If Rayfield failed to load, keep the functionality alive and make the error obvious.
 if not Rayfield then
-    warn("ESP build 14 loaded without Rayfield Gen2 UI: " .. tostring(RayfieldBootError or "unknown loader error"))
+    warn("GenAimer loaded without Rayfield Gen2 UI: " .. tostring(RayfieldBootError or "unknown loader error"))
 end

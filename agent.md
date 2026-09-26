@@ -6,7 +6,7 @@ GenAimer project.
 ## Canonical project location
 
 - Project root: `G:\My Drive\github\Roblox Aim Script`
-- Main source: `ESP_Rayfield_Build14_StartupHardened.lua`
+- Main source: `GenAimer.lua`
 - Remote repository: `https://github.com/cwarnes2007-stack/GenAimer`
 - Do not treat copies in Downloads as canonical or edit them unless explicitly
   requested.
@@ -62,6 +62,6 @@ Before handing off a change, verify:
 
 ## Versioning
 
-The current source still identifies itself as Build 14. A future structural
-rewrite or module split should be released as Build 15 rather than silently
-changing the Build 14 identity.
+The live source uses the `GenAimer` branding; Build 14 remains historical
+context in `changelog.md`. A future structural rewrite or module split should
+be documented as a new release rather than silently changing its identity.

@@ -5,11 +5,19 @@ aim-assist controls, movement utilities, profiles, diagnostics, and cleanup.
 
 ## Main file
 
-- `ESP_Rayfield_Build14_StartupHardened.lua` — current canonical source.
+- `GenAimer.lua` - current canonical source.
+
+- `GenAimer_Loadstring.lua` - copy-paste launcher for the GitHub version.
+
+For a one-line launcher, use:
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/cwarnes2007-stack/GenAimer/main/GenAimer.lua"))()
+```
 
 ## Codex skill
 
-- `.codex/skills/genaimer-project/SKILL.md` — project-aware instructions for
+- `.codex/skills/genaimer-project/SKILL.md` - project-aware instructions for
   maintaining and extending GenAimer with Codex.
 - Invoke it explicitly with `$genaimer-project`; automatic discovery is also
   enabled.

@@ -6,6 +6,11 @@ All notable changes to GenAimer are documented here.
 
 ### Added
 
+- Added dynamic skeleton support for standard R6/R15 rigs and custom models
+  connected by Motor6D joints.
+- Added a render-limited ESP scan interval control with a 1 ms setting that
+  updates on every available frame.
+- Added `GenAimer_Loadstring.lua` and a clean GitHub launcher snippet.
 - Added a smoother Legit aim feel with configurable target grace,
   acceleration, and maximum turn speed controls.
 - Added repository documentation and ignore rules.
@@ -20,6 +25,11 @@ All notable changes to GenAimer are documented here.
 
 ### Changed
 
+- Renamed the canonical source to `GenAimer.lua` and removed Build 14 and
+  Startup Hardened branding from the live interface.
+- Removed the temporary Status tab and replaced non-ASCII UI strings with
+  executor-friendly ASCII text.
+- Improved custom-model root-part detection and skeleton refresh handling.
 - Legit mode now eases into capped camera movement and preserves its target
   candidate briefly through transient scan misses.
 - Updated the agent guide to point to the active Google Drive repository path.

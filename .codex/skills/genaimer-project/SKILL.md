@@ -6,7 +6,7 @@ description: Maintain and extend the GenAimer Roblox Luau project, including its
 # GenAimer Project
 
 Work from the repository root and treat
-`ESP_Rayfield_Build14_StartupHardened.lua` as the canonical source. Do not edit
+`GenAimer.lua` as the canonical source. Do not edit
 copies in Downloads unless the user explicitly requests it.
 
 ## Before editing
