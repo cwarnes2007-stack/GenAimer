@@ -42,6 +42,9 @@ local Config = {
     AimAssist = false,
     AimMode = "Standard",
     LegitReactionTime = 0.12,
+    LegitTargetGrace = 0.12,
+    LegitAcceleration = 8,
+    LegitMaxTurnSpeed = 220,
     AimTeamCheck = true,
     AimLock = true,
     AimPrediction = false,
@@ -93,6 +96,8 @@ local LockedCharacter = nil
 local SelectedCharacter = nil
 local AimCandidateCharacter = nil
 local AimCandidateSince = 0
+local AimLastSeenAt = 0
+local AimMotionRate = 0
 local TargetScanCharacter = nil
 local TargetScanNextAt = 0
 local Unloaded = false
@@ -1630,6 +1635,8 @@ RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Last.Value + 3, f
     if not camera or not Config.AimAssist then
         LockedCharacter = nil
         AimCandidateCharacter = nil
+        AimLastSeenAt = 0
+        AimMotionRate = 0
         TargetScanCharacter = nil
         TargetScanNextAt = 0
         return
@@ -1642,6 +1649,8 @@ RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Last.Value + 3, f
         or UserInputService:GetFocusedTextBox() then
         LockedCharacter = nil
         AimCandidateCharacter = nil
+        AimLastSeenAt = 0
+        AimMotionRate = 0
         TargetScanCharacter = nil
         TargetScanNextAt = 0
         return
@@ -1653,12 +1662,26 @@ RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Last.Value + 3, f
     local target = findBestTarget(camera, mouse, origin, ownCharacter)
 
     if not target then
+        local now = os.clock()
+        local grace = math.max(Config.LegitTargetGrace or 0, 0)
+        if Config.AimMode == "Legit"
+            and AimCandidateCharacter
+            and AimLastSeenAt > 0
+            and now - AimLastSeenAt <= grace then
+            -- Keep the candidate and motion state briefly so a transient scan
+            -- miss does not restart the full Legit reaction delay.
+            return
+        end
+
         AimCandidateCharacter = nil
+        AimLastSeenAt = 0
+        AimMotionRate = 0
         TargetScanCharacter = nil
         return
     end
 
     SelectedCharacter = target.Character
+    AimLastSeenAt = os.clock()
 
     local aimStrength = math.clamp(Config.AimStrength, 0.01, 1)
     local aimFollowSpeed = math.clamp(Config.AimFollowSpeed or 100, 10, 100) / 100
@@ -1668,6 +1691,7 @@ RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Last.Value + 3, f
         if AimCandidateCharacter ~= target.Character then
             AimCandidateCharacter = target.Character
             AimCandidateSince = os.clock()
+            AimMotionRate = 0
             return
         end
 
@@ -1678,9 +1702,14 @@ RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Last.Value + 3, f
         -- Keep the final movement smooth and capped, even if aggressive
         -- slider values were previously saved in the profile.
         aimStrength = math.min(aimStrength, 0.16)
-        aimTurnSpeed = math.min(aimTurnSpeed, 240)
+        aimTurnSpeed = math.min(
+            aimTurnSpeed,
+            math.clamp(Config.LegitMaxTurnSpeed or 220, 60, 720)
+        )
     else
         AimCandidateCharacter = nil
+        AimLastSeenAt = 0
+        AimMotionRate = 0
     end
 
     local targetCFrame = CFrame.lookAt(camera.CFrame.Position, target.Position)
@@ -1692,12 +1721,32 @@ RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Last.Value + 3, f
 
         if angle > 0.0001 then
             if Config.AimMode == "Legit" and angle < math.rad(0.25) then
+                AimMotionRate = 0
                 return
             end
 
-            local strengthStep = angle * aimStrength * aimFollowSpeed
-            local turnStep = math.rad(aimTurnSpeed) * aimFollowSpeed * math.max(dt, 1 / 240)
-            local step = math.min(strengthStep, turnStep)
+            local step
+            if Config.AimMode == "Legit" then
+                local frameDt = math.max(dt, 1 / 240)
+                local maxTurnRate = math.rad(aimTurnSpeed) * aimFollowSpeed
+                local desiredRate = math.min(
+                    angle * aimStrength * aimFollowSpeed / frameDt,
+                    maxTurnRate
+                )
+                local acceleration = maxTurnRate * math.max(Config.LegitAcceleration or 8, 1)
+                local maxRateChange = acceleration * frameDt
+                AimMotionRate += math.clamp(
+                    desiredRate - AimMotionRate,
+                    -maxRateChange,
+                    maxRateChange
+                )
+                step = math.min(angle, AimMotionRate * frameDt)
+            else
+                local strengthStep = angle * aimStrength * aimFollowSpeed
+                local turnStep = math.rad(aimTurnSpeed) * aimFollowSpeed * math.max(dt, 1 / 240)
+                step = math.min(strengthStep, turnStep)
+            end
+
             local alpha = math.clamp(step / angle, 0, 1)
             camera.CFrame = camera.CFrame:Lerp(targetCFrame, alpha)
         end
@@ -2123,6 +2172,7 @@ local LEGIT_AIM_DEFAULTS = {
     AimStrength = 0.14,
     AimFollowSpeed = 75,
     AimTurnSpeed = 220,
+    LegitMaxTurnSpeed = 220,
     AimTarget = "Head",
     AimLeadTime = 0.08,
     AimPrediction = false,
@@ -2130,6 +2180,8 @@ local LEGIT_AIM_DEFAULTS = {
     SmoothAim = true,
     CameraRecoilDamping = false,
     LegitReactionTime = 0.06,
+    LegitTargetGrace = 0.12,
+    LegitAcceleration = 8,
     AimFrontOnly = true,
     AimFrontAngle = 80,
     AimScanInterval = 0.25,
@@ -2162,6 +2214,9 @@ local function captureAimSettings()
         SmoothAim = Config.SmoothAim,
         CameraRecoilDamping = Config.CameraRecoilDamping,
         LegitReactionTime = Config.LegitReactionTime,
+        LegitTargetGrace = Config.LegitTargetGrace,
+        LegitAcceleration = Config.LegitAcceleration,
+        LegitMaxTurnSpeed = Config.LegitMaxTurnSpeed,
         AimFrontOnly = Config.AimFrontOnly,
         AimFrontAngle = Config.AimFrontAngle,
         AimScanInterval = Config.AimScanInterval,
@@ -2180,6 +2235,9 @@ local function refreshAimControls()
     safeSet(Controls.SmoothAim, Config.SmoothAim)
     safeSet(Controls.CameraRecoilDamping, Config.CameraRecoilDamping)
     safeSet(Controls.LegitReactionTime, math.floor(Config.LegitReactionTime * 1000 + 0.5))
+    safeSet(Controls.LegitTargetGrace, math.floor(Config.LegitTargetGrace * 1000 + 0.5))
+    safeSet(Controls.LegitAcceleration, Config.LegitAcceleration)
+    safeSet(Controls.LegitMaxTurnSpeed, Config.LegitMaxTurnSpeed)
     safeSet(Controls.AimFrontOnly, Config.AimFrontOnly)
     safeSet(Controls.AimFrontAngle, Config.AimFrontAngle)
     safeSet(Controls.AimScanInterval, math.floor(Config.AimScanInterval * 1000 + 0.5))
@@ -2208,6 +2266,8 @@ local function setAimMode(mode)
     Config.AimMode = mode
     LockedCharacter = nil
     AimCandidateCharacter = nil
+    AimLastSeenAt = 0
+    AimMotionRate = 0
     TargetScanCharacter = nil
     TargetScanNextAt = 0
     refreshAimControls()
@@ -2220,6 +2280,8 @@ local function applyStandardRecommended()
     end
     LockedCharacter = nil
     AimCandidateCharacter = nil
+    AimLastSeenAt = 0
+    AimMotionRate = 0
     refreshAimControls()
     safeSet(Controls.AimMode, "Standard")
 end
@@ -2251,6 +2313,8 @@ local function restoreSessionConfig()
 
     LockedCharacter = nil
     AimCandidateCharacter = nil
+    AimLastSeenAt = 0
+    AimMotionRate = 0
     refreshAimControls()
 
     if Fullbright.Enabled ~= Config.Fullbright then
@@ -2491,6 +2555,9 @@ if Window then
                 if not value then
                     LockedCharacter = nil
                     SelectedCharacter = nil
+                    AimCandidateCharacter = nil
+                    AimLastSeenAt = 0
+                    AimMotionRate = 0
                     TargetScanCharacter = nil
                     TargetScanNextAt = 0
                 end
@@ -2499,7 +2566,7 @@ if Window then
 
         Controls.AimMode = AimTab:CreateDropdown({
             name = "Aim Mode",
-            description = "Standard follows immediately; Legit adds reaction and turn limits.",
+            description = "Standard follows immediately; Legit adds reaction, acceleration, and turn limits.",
             options = {"Standard", "Legit"},
             value = Config.AimMode,
             multiSelect = false,
@@ -2521,6 +2588,45 @@ if Window then
             flag = "LegitReactionTime",
             callback = function(value)
                 Config.LegitReactionTime = value / 1000
+            end,
+        })
+
+        Controls.LegitTargetGrace = AimTab:CreateSlider({
+            name = "Legit Target Grace",
+            description = "Keeps a target candidate briefly through transient scan misses.",
+            range = {0, 500},
+            increment = 10,
+            suffix = " ms",
+            value = math.floor(Config.LegitTargetGrace * 1000 + 0.5),
+            flag = "LegitTargetGrace",
+            callback = function(value)
+                Config.LegitTargetGrace = value / 1000
+            end,
+        })
+
+        Controls.LegitAcceleration = AimTab:CreateSlider({
+            name = "Legit Acceleration",
+            description = "How quickly smooth aim reaches its capped movement rate.",
+            range = {1, 20},
+            increment = 1,
+            suffix = "x/s",
+            value = Config.LegitAcceleration,
+            flag = "LegitAcceleration",
+            callback = function(value)
+                Config.LegitAcceleration = value
+            end,
+        })
+
+        Controls.LegitMaxTurnSpeed = AimTab:CreateSlider({
+            name = "Legit Maximum Turn Speed",
+            description = "Hard cap for Legit camera movement.",
+            range = {60, 720},
+            increment = 10,
+            suffix = " deg/s",
+            value = Config.LegitMaxTurnSpeed,
+            flag = "LegitMaxTurnSpeed",
+            callback = function(value)
+                Config.LegitMaxTurnSpeed = value
             end,
         })
 
@@ -3192,6 +3298,9 @@ local function setPanic(active)
         Config.WalkSpeedEnabled = false
         LockedCharacter = nil
         SelectedCharacter = nil
+        AimCandidateCharacter = nil
+        AimLastSeenAt = 0
+        AimMotionRate = 0
 
         setFullbright(false)
         setCursor(false)
@@ -3274,6 +3383,9 @@ unload = function()
     Config.WalkSpeedEnabled = false
     LockedCharacter = nil
     SelectedCharacter = nil
+    AimCandidateCharacter = nil
+    AimLastSeenAt = 0
+    AimMotionRate = 0
 
     pcall(function()
         RunService:UnbindFromRenderStep(ESP_BIND_NAME)

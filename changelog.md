@@ -6,6 +6,8 @@ All notable changes to GenAimer are documented here.
 
 ### Added
 
+- Added a smoother Legit aim feel with configurable target grace,
+  acceleration, and maximum turn speed controls.
 - Added repository documentation and ignore rules.
 - Added this agent guide and project changelog.
 - Added the project-local `$genaimer-project` Codex skill with UI metadata,
@@ -18,6 +20,9 @@ All notable changes to GenAimer are documented here.
 
 ### Changed
 
+- Legit mode now eases into capped camera movement and preserves its target
+  candidate briefly through transient scan misses.
+- Updated the agent guide to point to the active Google Drive repository path.
 - Moved the canonical source into the project repository folder.
 - Kept the Downloads copy as a non-canonical backup.
 - Updated the project skill and agent guide to require a changelog entry after

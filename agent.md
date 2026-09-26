@@ -5,7 +5,7 @@ GenAimer project.
 
 ## Canonical project location
 
-- Project root: `C:\Users\xboxg\Documents\GitHub\Roblox Aim Script`
+- Project root: `G:\My Drive\github\Roblox Aim Script`
 - Main source: `ESP_Rayfield_Build14_StartupHardened.lua`
 - Remote repository: `https://github.com/cwarnes2007-stack/GenAimer`
 - Do not treat copies in Downloads as canonical or edit them unless explicitly
