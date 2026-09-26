@@ -20,6 +20,9 @@ All notable changes to GenAimer are documented here.
 
 - Moved the canonical source into the project repository folder.
 - Kept the Downloads copy as a non-canonical backup.
+- Updated the project skill and agent guide to require a changelog entry after
+  every completed code change, teach GitHub concepts in context, and request
+  confirmation before commits, pushes, or merges.
 
 ## Build 14 - Startup Hardened
 

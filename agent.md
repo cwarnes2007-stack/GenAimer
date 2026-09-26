@@ -26,8 +26,12 @@ GenAimer project.
    hidden UI containers are unavailable.
 8. Keep line-of-sight validation enabled. Do not add anti-cheat bypasses or
    deliberate targeting through cover.
-9. Update `changelog.md` for every user-visible or behavior-changing edit.
+9. Update `changelog.md` under `Unreleased` whenever a code change is
+   completed. The code change is not complete until the entry exists.
 10. Store all project files inside the canonical project root.
+11. Do not commit, push, merge, or open a pull request automatically. Explain
+    the current Git state, share a short contextual GitHub tip, and ask the user
+    which repository action they want next.
 
 ## Style conventions
 
@@ -53,6 +57,8 @@ Before handing off a change, verify:
   restores camera, lighting, cursor, movement, and collision state.
 - New controls save and load through stable Rayfield flags.
 - The performance HUD remains readable at common viewport sizes.
+- `changelog.md` describes every completed code change.
+- The user has been asked before any commit, push, or merge operation.
 
 ## Versioning
 

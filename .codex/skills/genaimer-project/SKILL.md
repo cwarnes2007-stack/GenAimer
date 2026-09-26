@@ -45,21 +45,40 @@ Implement the smallest coherent change that satisfies the request. Reuse the
 existing helpers and control registry before adding new abstractions. Preserve
 unrelated user changes.
 
-After a user-visible or behavior-changing edit:
+After every completed code change:
 
-1. Update `changelog.md` under `Unreleased`.
+1. Update `changelog.md` under `Unreleased` before handing the work back. Do
+   not treat the code change as complete until its changelog entry exists.
 2. Inspect every modified section and its cleanup path.
 3. Check for duplicate Rayfield flags and stale Build identifiers.
 4. Run available Luau validation. If no Luau runtime is installed, state that
    limitation and perform a focused structural review instead.
-5. Review repository status and diff. Commit or push only when the user has
-   requested repository publication or clearly continued an existing publish
-   workflow.
+5. Review the current branch, repository status, and diff.
+
+## Git and GitHub coaching
+
+Do not commit, push, merge, or open a pull request automatically after a code
+change. At the end of each completed change:
+
+1. Summarize the working-tree state and name the current branch.
+2. Give the user one short Git or GitHub tip relevant to the current state. As
+   the project evolves, explain concepts such as working tree, staging, commit,
+   branch, push, pull request, and merge in context rather than as a long generic
+   tutorial.
+3. Propose a concise commit message when there are uncommitted changes.
+4. Ask whether the user wants to leave the changes uncommitted, commit them,
+   commit and push them, or merge a feature branch.
+
+Only offer a merge when a separate branch actually exists. If work is already
+on `main`, explain that there is nothing to merge and suggest using a feature
+branch for the next substantial change. Never interpret approval to commit as
+approval to push or merge; confirm each broader repository action.
 
 On this Windows machine, if `git` is not yet visible in the current process
 PATH, use `C:\Program Files\Git\cmd\git.exe` directly.
 
 ## Handoff
 
-Report the changed project files, the observable behavior, validation performed,
-and any runtime-only checks that still need to be performed in Roblox.
+Report the changed project files, observable behavior, validation performed,
+runtime-only checks that still need to be performed in Roblox, and the current
+Git state. Finish with the Git/GitHub tip and repository-action question.
